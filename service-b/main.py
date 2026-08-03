@@ -1,0 +1,82 @@
+"""
+service-b
+---------
+Recibe la orden validada desde service-a y la persiste en base de
+datos. Este servicio es el que ejercita el acceso a DB dentro del
+pipeline (auto-instrumentation para sqlite3 + custom span de negocio).
+
+Nota: se usa SQLite como base de datos local para esta primera
+versión funcional. Cuando el equipo defina el despliegue real en
+GCP/AWS, se evaluará si se mantiene o se reemplaza por una DB
+gestionada (eso es decisión de arquitectura, no de esta etapa).
+"""
+
+import sqlite3
+import logging
+
+from fastapi import FastAPI
+
+from opentelemetry import trace
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.instrumentation.sqlite3 import SQLite3Instrumentor
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+
+trace.set_tracer_provider(TracerProvider())
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("service-b")
+
+app = FastAPI(title="service-b")
+
+# --- Auto-instrumentación OTel (HTTP entrante y llamadas a sqlite3) ---
+FastAPIInstrumentor.instrument_app(app)
+SQLite3Instrumentor().instrument()
+
+tracer = trace.get_tracer("service-b")
+
+DB_PATH = "orders.db"
+
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, item TEXT, status TEXT)"
+    )
+    return conn
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "service-b"}
+
+
+@app.post("/process")
+def process_order(order: dict):
+    """
+    Procesa la orden recibida desde service-a y la guarda en DB.
+    El span 'persist_order' es un custom span de lógica de negocio,
+    separado de la instrumentación automática de sqlite3.
+    """
+    item = order.get("item", "desconocido")
+
+    with tracer.start_as_current_span("persist_order") as span:
+        span.set_attribute("order.item", item)
+        conn = get_db()
+        cursor = conn.execute(
+            "INSERT INTO orders (item, status) VALUES (?, ?)", (item, "processed")
+        )
+        conn.commit()
+        order_id = cursor.lastrowid
+        conn.close()
+        span.set_attribute("order.id", order_id)
+
+    logger.info(f"Orden procesada y guardada: id={order_id}, item={item}")
+
+    return {"order_id": order_id, "item": item, "status": "processed"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
