@@ -43,19 +43,19 @@ resource "aws_security_group" "otel_collector" {
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
-    description = "OTLP gRPC/HTTP + healthcheck desde dentro de la VPC"
+    description = "OTLP gRPC/HTTP - abierto a internet solo para el lab, no usar asi en produccion"
     from_port   = 4317
     to_port     = 4318
     protocol    = "tcp"
-    cidr_blocks = [data.aws_vpc.default.cidr_block]
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   ingress {
-    description = "Healthcheck"
+    description = "Healthcheck - abierto a internet solo para el lab, no usar asi en produccion"
     from_port   = 13133
     to_port     = 13133
     protocol    = "tcp"
-    cidr_blocks = [data.aws_vpc.default.cidr_block]
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   ingress {
