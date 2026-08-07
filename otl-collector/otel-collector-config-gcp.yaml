@@ -1,0 +1,78 @@
+# Config del OTel Collector para GCP. Misma imagen que otel-collector-config-aws.yaml,
+# solo difiere en el exporter de logs (aquí: googlecloud). El orquestador (ECS/K8s)
+# elige cuál cargar pasando --config=<este archivo o el de aws> como command override —
+# NO se controla con una variable de entorno dentro del YAML (eso causó un crash, ver git log).
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400
+    spike_limit_mib: 100
+
+  resource:
+    attributes:
+      - key: cloud.provider
+        value: ${env:CLOUD_PROVIDER}
+        action: upsert
+      - key: deployment.environment
+        value: ${env:DEPLOYMENT_ENV}
+        action: upsert
+
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  # Trazas -> Jaeger centralizado (desplegado en GKE, ver k8s/jaeger.yaml)
+  otlp/jaeger:
+    endpoint: ${env:JAEGER_OTLP_ENDPOINT}
+    tls:
+      insecure: ${env:JAEGER_TLS_INSECURE}
+
+  # Métricas -> Prometheus vía remote write (push, evita scrape cross-cloud)
+  prometheusremotewrite:
+    endpoint: ${env:PROMETHEUS_REMOTE_WRITE_ENDPOINT}
+    tls:
+      insecure: ${env:PROMETHEUS_TLS_INSECURE}
+
+  # Logs -> destino específico de cada nube (uno de los dos bloques de abajo aplica según despliegue)
+  googlecloud:
+    project: ${env:GCP_PROJECT_ID}
+
+  awscloudwatchlogs:
+    log_group_name: ${env:CLOUDWATCH_LOG_GROUP}
+    log_stream_name: ${env:CLOUDWATCH_LOG_STREAM}
+    region: ${env:AWS_REGION}
+
+  # Útil mientras depuras localmente
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlp/jaeger, debug]
+
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [prometheusremotewrite, debug]
+
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [googlecloud, debug]
