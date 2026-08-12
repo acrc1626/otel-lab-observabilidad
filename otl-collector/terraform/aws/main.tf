@@ -76,6 +76,14 @@ resource "aws_security_group" "observability" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  ingress {
+    description = "service-a (8000) y service-b (8001, para cuando exista) - solo para el lab"
+    from_port   = 8000
+    to_port     = 8001
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -322,10 +330,83 @@ resource "aws_ecs_service" "prometheus" {
   }
 }
 
+# ============================================================
+# Servicio 4: service-a — el microservicio real de Astrid.
+# Su código ya lee OTEL_EXPORTER_OTLP_ENDPOINT del entorno (no
+# necesita ningún cambio), solo hay que dárselo al desplegar.
+# ============================================================
+resource "aws_ecs_task_definition" "service_a" {
+  family                   = "service-a"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+  # Sin task_role_arn: service-a no llama a ninguna API de AWS por su cuenta,
+  # solo habla OTLP con el Collector y HTTP normal con service-b.
+
+  container_definitions = jsonencode([
+    {
+      name      = "service-a"
+      image     = var.service_a_image
+      essential = true
+      portMappings = [
+        { containerPort = 8000, protocol = "tcp" }
+      ]
+      environment = [
+        # El SDK de OTel le agrega automáticamente /v1/traces y /v1/metrics a esta
+        # base — no hace falta (ni hay que) escribir la ruta completa como en los
+        # curl manuales.
+        { name = "OTEL_EXPORTER_OTLP_ENDPOINT", value = "http://${var.collector_public_ip}:4318" },
+        { name = "SERVICE_B_URL", value = var.service_b_url }
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.ecs_task_logs.name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "service-a"
+        }
+      }
+    }
+  ])
+}
+
+resource "aws_ecs_service" "service_a" {
+  name            = "service-a"
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.service_a.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = data.aws_subnets.default.ids
+    security_groups  = [aws_security_group.observability.id]
+    assign_public_ip = true
+  }
+}
+
 variable "prometheus_public_ip" {
   description = "IP pública de la tarea de Prometheus. Fargate la asigna en tiempo de ejecución, así que en el primer apply (cuando Prometheus todavía no existe) pasa un valor cualquiera (ej. '0.0.0.0'); después de que Prometheus esté corriendo, saca su IP real con el output get_prometheus_public_ip_command y vuelve a aplicar para que el Collector apunte a la IP correcta."
   type        = string
   default     = "0.0.0.0"
+}
+
+variable "collector_public_ip" {
+  description = "IP pública de la tarea del Collector. Mismo patrón que prometheus_public_ip: no existe hasta el primer apply, así que arranca con un valor de relleno y se corrige en un apply posterior con la IP real (terraform output get_collector_public_ip_command)."
+  type        = string
+  default     = "0.0.0.0"
+}
+
+variable "service_a_image" {
+  description = "Imagen de service-a ya publicada en ECR (docker build + push, este módulo no la construye)."
+  type        = string
+}
+
+variable "service_b_url" {
+  description = "URL de service-b. Placeholder hasta que ese servicio exista — actualízalo y vuelve a aplicar cuando esté desplegado."
+  type        = string
+  default     = "http://localhost:8001"
 }
 
 output "ecr_repository_url" {
@@ -353,4 +434,9 @@ output "get_jaeger_public_ip_command" {
 output "get_prometheus_public_ip_command" {
   description = "IP pública de la tarea de Prometheus. La necesita este mismo módulo (variable prometheus_public_ip, para el segundo apply) y GCP (variable aws_prometheus_public_ip)."
   value = "aws ecs describe-tasks --cluster ${aws_ecs_cluster.this.name} --tasks $(aws ecs list-tasks --cluster ${aws_ecs_cluster.this.name} --service-name prometheus --query 'taskArns[0]' --output text) --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text | xargs -I{} aws ec2 describe-network-interfaces --network-interface-ids {} --query 'NetworkInterfaces[0].Association.PublicIp' --output text"
+}
+
+output "get_service_a_public_ip_command" {
+  description = "IP pública de la tarea de service-a — úsala para pegarle a /health y /order desde afuera."
+  value = "aws ecs describe-tasks --cluster ${aws_ecs_cluster.this.name} --tasks $(aws ecs list-tasks --cluster ${aws_ecs_cluster.this.name} --service-name service-a --query 'taskArns[0]' --output text) --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text | xargs -I{} aws ec2 describe-network-interfaces --network-interface-ids {} --query 'NetworkInterfaces[0].Association.PublicIp' --output text"
 }

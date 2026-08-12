@@ -2,9 +2,15 @@ fastapi==0.115.0
 uvicorn==0.30.6
 requests==2.32.3
 
+# setuptools: opentelemetry-instrumentation importa pkg_resources internamente,
+# que viene de este paquete — no se instala solo con pip moderno ni con
+# python:3.12-slim, hay que pedirlo explícito.
+setuptools==75.1.0
+
 # OpenTelemetry - instrumentación
 opentelemetry-api==1.27.0
 opentelemetry-sdk==1.27.0
 opentelemetry-exporter-otlp==1.27.0
+opentelemetry-exporter-otlp-proto-http==1.27.0
 opentelemetry-instrumentation-fastapi==0.48b0
 opentelemetry-instrumentation-requests==0.48b0

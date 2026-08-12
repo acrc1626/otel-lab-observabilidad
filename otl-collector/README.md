@@ -3,80 +3,113 @@
 ## Qué incluye este paquete
 - `otel-collector-config-aws.yaml` / `otel-collector-config-gcp.yaml`: mismo pipeline base, pero difieren en el destino de trazas y logs (AWS: X-Ray + CloudWatch; GCP: Jaeger + Cloud Logging). Métricas van a Prometheus en ambas — es el único backend centralizado y compartido. Cada archivo solo declara los exporters que esa nube realmente usa (el Collector valida hasta los que no usa, ver apéndice). Las dos configs quedan horneadas en la **misma imagen** — Terraform le dice a cada despliegue cuál cargar (vía `command`/`args`), no una variable de entorno dentro del YAML (eso causó un crash real, ver el apéndice).
 - `Dockerfile`: imagen basada en `otel-collector-contrib`, con las dos configs incluidas.
-- `terraform/aws/`: ECR (referenciado, se crea a mano), log groups, IAM (incluye permisos de X-Ray), cluster ECS, security group compartido, y **3 servicios independientes** — Collector, Jaeger y Prometheus, cada uno en su propia tarea/ENI (no comparten red entre sí).
+- `service-a/`: el microservicio real de Astrid (FastAPI + OTel SDK) — ya lee `OTEL_EXPORTER_OTLP_ENDPOINT` del entorno, no necesita cambios de código.
+- `terraform/aws/`: ECR (referenciado, se crea a mano), log groups, IAM (incluye permisos de X-Ray), cluster ECS, security group compartido, y **4 servicios independientes** — Collector, Jaeger, Prometheus y service-a, cada uno en su propia tarea/ENI (no comparten red entre sí).
 - `terraform/gcp/`: Artifact Registry (referenciado) y un servicio de Cloud Run para el Collector — le exporta trazas directo a Jaeger y métricas directo a Prometheus, ambos en AWS, sin pasar por el Collector de AWS.
-
-Todo el despliegue de infraestructura es por Terraform. Lo único manual, en ambas nubes, es construir y subir la imagen Docker — Terraform no compila imágenes.
 
 ---
 
-## Paso 0 — Construir la imagen (una sola vez, sirve para las dos nubes)
+## Paso 0 — Construir la imagen de `otel-collector` (una sola vez, sirve para las dos nubes)
 ```bash
 cd otel-collector
 docker build -t otel-collector:latest .
 ```
+Esta misma imagen se publica en dos registries distintos más abajo (ECR y Artifact Registry) — no hay que reconstruirla por nube.
 
 ---
 
 ## AWS
 
-**1. Crear el repositorio en ECR** (una vez, si no existe — se maneja fuera de Terraform a propósito, ver apéndice)
+### 0. Confirmar (o cambiar) la cuenta activa
+
+Antes de crear nada, confirma con cuál cuenta/perfil vas a trabajar — tienes varios perfiles guardados y es fácil terminar en el equivocado:
+```bash
+aws sts get-caller-identity
+```
+Te muestra el `Account` activo. Si no es el que quieres:
+```bash
+aws configure list-profiles          # ver qué perfiles tienes disponibles
+export AWS_PROFILE=<nombre-del-perfil>
+aws sts get-caller-identity          # confirma que ya cambió
+```
+*(si te da error de credenciales o SSL, ver apéndice)*
+
+### 1. Imágenes (repos + build + tag + push)
+
+**otel-collector** (ya construida en el Paso 0 — aquí solo se crea el repo y se sube):
 ```bash
 aws ecr create-repository --repository-name otel-collector --region us-east-1
-```
 
-**2. Login, tag y push**
-```bash
 aws ecr get-login-password --region us-east-1 | \
   docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com
 
 docker tag otel-collector:latest <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/otel-collector:latest
 docker push <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/otel-collector:latest
 ```
-`<ACCOUNT_ID>` es el número de cuenta de AWS (12 dígitos). Para obtenerlo directo, sin tener que copiarlo a mano del JSON completo:
+`<ACCOUNT_ID>` (12 dígitos): `aws sts get-caller-identity --query Account --output text`
+
+**service-a** (repo, build y push completos — esta imagen es nueva, no se construyó en el Paso 0):
+
+> El login de Docker a ECR (paso anterior) expira cada ~12h. Si pasó tiempo desde que lo hiciste y el `push` falla con `denied: Your authorization token has expired`, repite el `aws ecr get-login-password | docker login ...` de arriba antes de seguir.
 ```bash
-aws sts get-caller-identity --query Account --output text
+aws ecr create-repository --repository-name service-a --region us-east-1
+
+cd service-a
+docker build -t service-a:latest .
+docker tag service-a:latest <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/service-a:latest
+docker push <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/service-a:latest
+cd ..
 ```
 
-**3. Desplegar — en dos pasos**
+Al terminar esta sección: dos imágenes en ECR (`otel-collector` y `service-a`), nada desplegado todavía.
 
-Ahora son **3 servicios independientes** (Collector, Jaeger, Prometheus — ya no comparten tarea), cada uno con su propio ENI/IP pública. Esto crea una dependencia circular chiquita: el Collector necesita saber la IP de Prometheus para exportarle métricas, pero esa IP no existe hasta que Prometheus ya esté desplegado. Por eso el primer `apply` usa una IP de relleno, y el segundo ya usa la real:
+### 2. Desplegar con Terraform
+
+Son **4 servicios independientes** (Collector, Jaeger, Prometheus, service-a — ninguno comparte tarea), cada uno con su propio ENI/IP pública. Como ya construiste las dos imágenes en el paso anterior, el primer `apply` ya puede crear los 4 servicios de una vez — lo único que falta son las **IPs**, que no existen hasta que algo ya está corriendo (por eso arrancan con un valor de relleno y se corrigen en un segundo `apply`):
 
 ```bash
 cd terraform/aws
 terraform init
 
-# Paso 3a: primer apply, sin la IP real de Prometheus todavía (usa el default "0.0.0.0")
-terraform apply -var="collector_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/otel-collector:latest"
-```
-Esto crea: log groups, roles IAM (incluyendo permisos de X-Ray para el Collector), cluster ECS, security group compartido, y las 3 tareas.
-
-```bash
-# Paso 3b: obtener la IP real de Prometheus
-terraform output get_prometheus_public_ip_command
-# corre el comando que te imprime, o repite el patrón manual con aws ecs describe-tasks / aws ec2 describe-network-interfaces
-```
-
-```bash
-# Paso 3c: segundo apply, ahora sí con la IP real — esto redespliega SOLO el Collector
-# (Jaeger y Prometheus no cambian, ya están corriendo bien desde el paso 3a)
+# Primer apply: las dos imágenes YA las tienes, así que van desde ahora.
+# prometheus_public_ip y collector_public_ip usan su default "0.0.0.0" —
+# el Collector y service-a arrancan "a ciegas" por un momento, se corrige abajo.
 terraform apply \
   -var="collector_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/otel-collector:latest" \
-  -var="prometheus_public_ip=<IP_DE_PROMETHEUS>"
+  -var="service_a_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/service-a:latest"
 ```
+Esto crea: log groups, roles IAM (incluyendo permisos de X-Ray), cluster ECS, security group compartido, y las 4 tareas.
 
-**4. Obtener las otras dos IPs públicas** (Collector y Jaeger — las vas a necesitar para GCP y para validar)
 ```bash
+# Obtener las IPs reales de Prometheus y del Collector
+terraform output get_prometheus_public_ip_command
 terraform output get_collector_public_ip_command
-terraform output get_jaeger_public_ip_command
+
+# Segundo apply: mismas dos imágenes + las dos IPs reales — redespliega
+# SOLO el Collector y service-a (Jaeger y Prometheus no cambian)
+terraform apply \
+  -var="collector_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/otel-collector:latest" \
+  -var="service_a_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/service-a:latest" \
+  -var="prometheus_public_ip=<IP_DE_PROMETHEUS>" \
+  -var="collector_public_ip=<IP_DEL_COLLECTOR>"
 ```
-Con las IPs: Jaeger UI en `http://<IP_JAEGER>:16686`, Prometheus en `http://<IP_PROMETHEUS>:9090`, healthcheck del Collector en `http://<IP_COLLECTOR>:13133/`. Las trazas de AWS ya no pasan por Jaeger — van a **AWS X-Ray**, revisa la consola de X-Ray en vez de Jaeger UI para esas.
 
-**5. Probar manualmente con `curl`** (sin esperar a los microservicios de Astrid)
+**Obtener el resto de las IPs** (Jaeger y service-a):
+```bash
+terraform output get_jaeger_public_ip_command
+terraform output get_service_a_public_ip_command
+```
+Jaeger UI: `http://<IP_JAEGER>:16686` · Prometheus: `http://<IP_PROMETHEUS>:9090` · healthcheck del Collector: `http://<IP_COLLECTOR>:13133/`. Las trazas de AWS van a **X-Ray**, no a Jaeger.
 
-Todo se manda al **Collector** (nunca directo a Jaeger/Prometheus/X-Ray) — el Collector es quien decide a dónde reenviar.
+*(si haces cambios y vuelves a subir una imagen al mismo tag `latest`, Terraform no siempre detecta el cambio — fuerza el redeploy: `aws ecs update-service --cluster otel-lab-cluster --service <nombre-del-servicio> --force-new-deployment`)*
 
-Trazas (puerto 4318 = OTLP HTTP):
+> **Importante**: de aquí en adelante, **todo `terraform apply` en esta carpeta necesita las 4 variables** (`collector_image`, `service_a_image`, `prometheus_public_ip`, `collector_public_ip`) — como los 4 servicios ya existen en el estado de Terraform, un `apply` que omita alguna te la va a preguntar de forma interactiva, y si la dejas vacía por error (como pasó con `service_a_image` antes de este ajuste), el despliegue de ese servicio falla. Guarda el comando completo del segundo `apply` de arriba en algún lado para reusarlo tal cual.
+
+### 3. Probar manualmente con `curl`
+
+Todo se manda al **Collector** (nunca directo a Jaeger/Prometheus/X-Ray) — el Collector decide a dónde reenviar. Trazas y métricas son dos rutas OTLP distintas (`/v1/traces` vs `/v1/metrics`) — en una app real el SDK las despacha solo, aquí las simulamos a mano.
+
+**Trazas** (puerto 4318 = OTLP HTTP):
 ```bash
 EPOCH_HEX=$(printf '%08x' $(date +%s))
 TRACE_ID="${EPOCH_HEX}$(openssl rand -hex 12)"
@@ -88,18 +121,17 @@ curl -X POST http://<IP_COLLECTOR>:4318/v1/traces \
   -H "Content-Type: application/json" \
   -d "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"prueba-manual-aws\"}}]},\"scopeSpans\":[{\"spans\":[{\"traceId\":\"$TRACE_ID\",\"spanId\":\"$SPAN_ID\",\"name\":\"span-de-prueba-xray\",\"kind\":1,\"startTimeUnixNano\":\"$NOW\",\"endTimeUnixNano\":\"$END\"}]}]}]}"
 ```
-Respuesta esperada: `{"partialSuccess":{}}` (vacío = éxito). Revisa en la consola de **X-Ray** (`us-east-1`, filtro de tiempo "Last 5 minutes").
+Respuesta esperada: `{"partialSuccess":{}}`. Revisa en **X-Ray** (`us-east-1`, "Last 5 minutes").
+> El `TRACE_ID` no es cualquier string: X-Ray exige que los primeros 8 caracteres hex sean la fecha/hora Unix actual — el comando de arriba ya lo genera bien.
 
-> El `TRACE_ID` no puede ser cualquier string aleatorio: X-Ray exige que los primeros 8 caracteres hex representen la fecha/hora Unix actual. Si usas un ID con una fecha vieja incrustada, X-Ray descarta el segmento en silencio, sin ningún error visible — el comando de arriba ya genera el ID con el formato correcto.
-
-Métricas (mismo Collector, misma IP, ruta `/v1/metrics`):
+**Métricas**:
 ```bash
 NOW=$(date +%s%N)
 curl -X POST http://<IP_COLLECTOR>:4318/v1/metrics \
   -H "Content-Type: application/json" \
   -d "{\"resourceMetrics\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"prueba-manual-aws\"}}]},\"scopeMetrics\":[{\"metrics\":[{\"name\":\"prueba_metrica_aws\",\"gauge\":{\"dataPoints\":[{\"asDouble\":42,\"timeUnixNano\":\"$NOW\"}]}}]}]}]}"
 ```
-Revisa en **Prometheus** (`http://<IP_PROMETHEUS>:9090`, no la IP del Collector) — en el cuadro de búsqueda escribe solo el nombre de la métrica: `prueba_metrica_aws`. Un solo `curl` te da una línea recta (un único punto) — para una gráfica con variación real:
+Revisa en **Prometheus** (`http://<IP_PROMETHEUS>:9090`) — busca `prueba_metrica_aws`. Un solo `curl` da una línea recta; para una gráfica con variación real:
 ```bash
 for i in $(seq 1 20); do
   VALUE=$((RANDOM % 100))
@@ -111,19 +143,19 @@ for i in $(seq 1 20); do
 done
 ```
 
-> Trazas y métricas son dos rutas OTLP distintas (`/v1/traces` vs `/v1/metrics`), por eso hacen falta dos peticiones separadas al probar a mano con `curl`. En una app real instrumentada con el SDK de OTel esto no lo notas — el SDK genera y despacha ambas señales automáticamente a partir del mismo código.
-
-**6. Si haces cambios y vuelves a subir la imagen al mismo tag `latest`**
-El tag mutable no siempre dispara un redeploy automático en Terraform. Fuerza uno (ajusta `--service` al que corresponda: `otel-collector`, `jaeger` o `prometheus`):
+**service-a (el microservicio real)**:
 ```bash
-aws ecs update-service --cluster otel-lab-cluster --service otel-collector --force-new-deployment
+curl http://<IP_SERVICE_A>:8000/health
+curl -X POST http://<IP_SERVICE_A>:8000/order -H "Content-Type: application/json" -d '{"item":"prueba-real"}'
 ```
+El segundo `curl` va a fallar con `502` (porque `service-b` todavía no existe) — **eso está bien por ahora**, lo importante es revisar **X-Ray**: debería aparecer una traza real generada por FastAPI, con el span automático de la petición HTTP y tu span custom `validate_order` anidado.
 
-**7. Pausar sin destruir infraestructura** (mientras depuras algo, para no seguir pagando)
+**Pausar sin destruir infraestructura** (mientras depuras algo, para no seguir pagando):
 ```bash
 aws ecs update-service --cluster otel-lab-cluster --service otel-collector --desired-count 0
 aws ecs update-service --cluster otel-lab-cluster --service jaeger --desired-count 0
 aws ecs update-service --cluster otel-lab-cluster --service prometheus --desired-count 0
+aws ecs update-service --cluster otel-lab-cluster --service service-a --desired-count 0
 # para reanudar cualquiera: --desired-count 1
 ```
 
@@ -131,11 +163,13 @@ aws ecs update-service --cluster otel-lab-cluster --service prometheus --desired
 
 ## GCP
 
-**1. Login y elegir el proyecto**
+### 0. Preparar el entorno
+
+**Login y elegir el proyecto**
 ```bash
 gcloud auth login
 ```
-*(si `gcloud` no está instalado, o si cualquier comando de `gcloud` falla con `certificate verify failed`, ve al apéndice — proxy corporativo, mismo problema que con `aws-cli`)*
+*(si `gcloud` no está instalado, o si cualquier comando falla con `certificate verify failed`, ver apéndice — proxy corporativo)*
 
 Intenta crear un proyecto dedicado para el lab:
 ```bash
@@ -149,16 +183,14 @@ gcloud projects list
 gcloud config set project <TU_PROJECT_ID>
 ```
 
-Confirma que la facturación esté vinculada:
+**Confirmar facturación**
 ```bash
 gcloud billing projects describe <TU_PROJECT_ID>
 ```
 Busca `billingEnabled: true`. Si dice `false`: `https://console.cloud.google.com/billing/linkedaccount?project=<TU_PROJECT_ID>`
 *(si venías de un Free Trial y ya se convirtió a cuenta de pago, es normal e irreversible — el crédito no usado se sigue consumiendo primero de todas formas)*
 
-**2. Habilitar las APIs necesarias**
-
-Un proyecto nuevo (o poco usado, como el "Default Gemini Project") trae casi todas las APIs desactivadas — no solo las obvias (Artifact Registry, Cloud Run), también dos que Terraform necesita internamente para funcionar y que no son evidentes hasta que fallan a mitad de un `apply`:
+**Habilitar las APIs necesarias**
 ```bash
 gcloud services enable \
   artifactregistry.googleapis.com \
@@ -167,25 +199,11 @@ gcloud services enable \
   cloudresourcemanager.googleapis.com \
   --project=<TU_PROJECT_ID>
 ```
-Espera 30-60 segundos después de correr esto — la activación tarda en propagarse antes de que otros comandos la reconozcan.
+Espera 30-60 segundos — la activación tarda en propagarse.
 
-**3. Crear el repositorio en Artifact Registry y subir la imagen**
-```bash
-gcloud artifacts repositories create observability \
-  --repository-format=docker --location=us-central1 \
-  --description="Imagenes del lab de observabilidad" \
-  --project=<TU_PROJECT_ID>
+**Autenticar Terraform (cuenta de servicio)**
 
-gcloud auth configure-docker us-central1-docker.pkg.dev
-
-docker tag otel-collector:latest us-central1-docker.pkg.dev/<TU_PROJECT_ID>/observability/otel-collector:latest
-docker push us-central1-docker.pkg.dev/<TU_PROJECT_ID>/observability/otel-collector:latest
-```
-*(si Docker Desktop no está corriendo, `docker tag` falla con un error de "pipe"/conexión — ábrelo y reintenta. Para ver el repo en la consola: busca "Artifact Registry" en el buscador de arriba, no siempre aparece en el menú lateral ☰)*
-
-**4. Autenticar Terraform (cuenta de servicio)**
-
-`gcloud auth login` autentica el CLI, pero **Terraform necesita sus propias credenciales** (Application Default Credentials) — son dos mecanismos separados. El camino obvio, `gcloud auth application-default login`, suele fallar en redes corporativas porque depende de un redirect a `localhost` que el proxy bloquea (y su alternativa `--no-browser`/`--remote-bootstrap` está pensada para correrse en una segunda máquina, no en la misma). El camino confiable es darle a Terraform una cuenta de servicio propia, autenticada con tu sesión normal de `gcloud auth login` (que sí funciona bien):
+`gcloud auth login` autentica el CLI, pero **Terraform necesita sus propias credenciales** — son dos mecanismos separados. `gcloud auth application-default login` suele fallar en redes corporativas (redirect a `localhost` bloqueado por el proxy). El camino confiable:
 ```bash
 gcloud iam service-accounts create terraform-otel-lab --display-name="Terraform OTel Lab" --project=<TU_PROJECT_ID>
 
@@ -198,11 +216,27 @@ gcloud iam service-accounts keys create ~/terraform-otel-lab-key.json --iam-acco
 
 export GOOGLE_APPLICATION_CREDENTIALS="/c/Users/<tu_usuario>/terraform-otel-lab-key.json"
 ```
-Terraform detecta esa variable de entorno automáticamente. La clave `.json` es sensible — ya está en `.gitignore`, nunca la subas al repo.
+Terraform detecta esa variable automáticamente. La clave `.json` es sensible — ya está en `.gitignore`.
 
-**5. Desplegar en Cloud Run**
+### 1. Imagen (repo + tag + push)
 
-Jaeger y Prometheus ya están corriendo en AWS (cada uno en su propia tarea, con su propia IP pública) — el Collector de GCP le exporta a cada uno directamente, sin pasar por el Collector de AWS. A diferencia de GKE, aquí no hay clúster, VPC ni subnets que crear.
+Es la misma imagen `otel-collector` que ya construiste en el Paso 0 — aquí solo se crea el repositorio de GCP y se sube una copia, no hay que reconstruirla:
+```bash
+gcloud artifacts repositories create observability \
+  --repository-format=docker --location=us-central1 \
+  --description="Imagenes del lab de observabilidad" \
+  --project=<TU_PROJECT_ID>
+
+gcloud auth configure-docker us-central1-docker.pkg.dev
+
+docker tag otel-collector:latest us-central1-docker.pkg.dev/<TU_PROJECT_ID>/observability/otel-collector:latest
+docker push us-central1-docker.pkg.dev/<TU_PROJECT_ID>/observability/otel-collector:latest
+```
+*(si Docker Desktop no está corriendo, `docker tag`/`push` fallan con un error de "pipe"/conexión — ábrelo y reintenta)*
+
+### 2. Desplegar con Terraform
+
+Jaeger y Prometheus ya están corriendo en AWS — el Collector de GCP le exporta a cada uno directamente, sin pasar por el Collector de AWS. Aquí no hay clúster, VPC ni subnets que crear.
 ```bash
 cd terraform/gcp
 terraform init
@@ -212,19 +246,18 @@ terraform apply \
   -var="aws_jaeger_public_ip=<IP_DE_JAEGER>" \
   -var="aws_prometheus_public_ip=<IP_DE_PROMETHEUS>"
 ```
-Ambas IPs salen de la sección de AWS (`terraform output get_jaeger_public_ip_command` y `get_prometheus_public_ip_command`).
+Ambas IPs salen de la sección de AWS.
 
-*(si el `apply` falla con algo como "repository not found", el repo del paso 3 no quedó creado en el mismo proyecto que le estás pasando en `project_id`. Si falla el recurso `google_cloud_run_v2_service_iam_member` de acceso público, puede ser una política organizacional que restrinja compartir con `allUsers` — poco probable en cuenta personal)*
+*(si falla con "repository not found", el repo del paso 1 no quedó en el mismo proyecto que `project_id`. Si falla `google_cloud_run_v2_service_iam_member` de acceso público, puede ser una política organizacional restringiendo `allUsers` — poco probable en cuenta personal)*
 
-**6. Obtener la URL pública del Collector**
 ```bash
 terraform output collector_url
 ```
-A diferencia de AWS (una IP + puerto plano), Cloud Run te da una URL HTTPS (`https://otel-collector-xxxxx-uc.a.run.app`), sin puerto explícito. Esa URL enruta al receiver **HTTP** de OTLP (equivalente al `:4318` de AWS) — usa las rutas `/v1/traces`, `/v1/metrics` con `Content-Type: application/json`. Los microservicios de GCP deben mandar su OTLP ahí **con TLS habilitado** (no `insecure=true` como en AWS, porque Cloud Run exige HTTPS de cara al público). Si tu SDK está configurado para gRPC en vez de HTTP, no va a funcionar contra esta URL — ver la nota en `terraform/gcp/main.tf` sobre cómo cambiar el puerto expuesto a 4317 si lo necesitas.
+Cloud Run da una URL HTTPS (`https://otel-collector-xxxxx-uc.a.run.app`), sin puerto explícito — enruta al receiver **HTTP** de OTLP (equivalente al `:4318` de AWS). Los microservicios de GCP deben mandar su OTLP ahí **con TLS habilitado**.
 
-**7. Probar manualmente con `curl`**
+### 3. Probar manualmente con `curl`
 
-Mismo patrón que en AWS, pero contra la URL de Cloud Run — sin puerto en la URL, con `--cacert` si tu red tiene inspección SSL corporativa (ver apéndice):
+Mismo patrón que en AWS, pero contra la URL de Cloud Run — sin puerto, con `--cacert` si tu red tiene inspección SSL corporativa (ver apéndice):
 ```bash
 EPOCH_HEX=$(printf '%08x' $(date +%s))
 TRACE_ID="${EPOCH_HEX}$(openssl rand -hex 12)"
@@ -236,15 +269,14 @@ curl -i --cacert "/c/Users/<tu_usuario>/aws-ca-bundle.pem" -X POST <TU_COLLECTOR
   -H "Content-Type: application/json" \
   -d "{\"resourceSpans\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"prueba-manual-gcp\"}}]},\"scopeSpans\":[{\"spans\":[{\"traceId\":\"$TRACE_ID\",\"spanId\":\"$SPAN_ID\",\"name\":\"span-de-prueba-gcp\",\"kind\":1,\"startTimeUnixNano\":\"$NOW\",\"endTimeUnixNano\":\"$END\"}]}]}]}"
 ```
-Revisa en **Jaeger UI** (`http://<IP_JAEGER>:16686`, la IP de AWS) — cambia el desplegable "Service" de `jaeger-all-in-one` (que es Jaeger monitoreándose a sí mismo) a `prueba-manual-gcp`.
-
+Revisa en **Jaeger UI** (`http://<IP_JAEGER>:16686`) — cambia el desplegable "Service" de `jaeger-all-in-one` (Jaeger monitoreándose a sí mismo) a `prueba-manual-gcp`.
 ```bash
 NOW=$(date +%s%N)
 curl -i --cacert "/c/Users/<tu_usuario>/aws-ca-bundle.pem" -X POST <TU_COLLECTOR_URL>/v1/metrics \
   -H "Content-Type: application/json" \
   -d "{\"resourceMetrics\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"prueba-manual-gcp\"}}]},\"scopeMetrics\":[{\"metrics\":[{\"name\":\"prueba_metrica_gcp\",\"gauge\":{\"dataPoints\":[{\"asDouble\":77,\"timeUnixNano\":\"$NOW\"}]}}]}]}]}"
 ```
-Revisa en **Prometheus** (`http://<IP_PROMETHEUS>:9090`, la misma IP compartida de siempre) — busca `prueba_metrica_gcp`, o para ver ambas nubes juntas en una sola consulta: `up{cloud_provider="gcp"}` y `up{cloud_provider="aws"}`.
+Revisa en **Prometheus** — busca `prueba_metrica_gcp`, o para ver ambas nubes juntas: `up{cloud_provider="gcp"}` y `up{cloud_provider="aws"}`.
 
 ---
 
@@ -253,15 +285,15 @@ Revisa en **Prometheus** (`http://<IP_PROMETHEUS>:9090`, la misma IP compartida 
 - Trazas de GCP → **Jaeger UI** (`http://<IP_JAEGER>:16686`), filtrando por servicio.
 - Métricas de ambas nubes → **Prometheus** (`http://<IP_PROMETHEUS>:9090`), un solo backend compartido.
 - Logs de AWS → **CloudWatch**. Logs de GCP → **Cloud Logging**.
-- Healthcheck del Collector de AWS: `GET http://<IP_COLLECTOR>:13133/`. El de GCP no es accesible públicamente (Cloud Run solo enruta al puerto principal) — revisa el estado del servicio en la consola de Cloud Run en su lugar.
+- Healthcheck del Collector de AWS: `GET http://<IP_COLLECTOR>:13133/`. El de GCP no es accesible públicamente — revisa el estado del servicio en la consola de Cloud Run.
 
 ## Pendiente para el reporte técnico
 - [ ] Capturas del healthcheck del Collector de AWS.
 - [ ] Captura de la consola de AWS X-Ray con trazas de los microservicios de AWS.
 - [ ] Captura de Jaeger UI con trazas de los microservicios de GCP.
-- [ ] Captura de Prometheus mostrando métricas etiquetadas `cloud.provider=aws` y `cloud.provider=gcp` — evidencia de correlación cross-cloud en el backend de métricas.
-- [ ] Explicación breve en el reporte de por qué las trazas se dividen así (siguiendo el enunciado de la actividad: Jaeger para GCP, X-Ray para AWS) mientras que las métricas sí quedan centralizadas en un solo Prometheus.
-- [ ] Diagrama actualizado del pipeline (los 3 servicios separados en AWS + Cloud Run en GCP).
+- [ ] Captura de Prometheus mostrando métricas etiquetadas `cloud.provider=aws` y `cloud.provider=gcp`.
+- [ ] Explicación breve de por qué las trazas se dividen así (Jaeger para GCP, X-Ray para AWS, según la actividad) mientras las métricas quedan centralizadas en un solo Prometheus.
+- [ ] Diagrama actualizado del pipeline (4 servicios en AWS + Cloud Run en GCP).
 - [ ] Captura del `terraform apply` exitoso en ambas nubes.
 
 ## Limpieza (evitar gastar créditos de más)
@@ -274,60 +306,56 @@ cd ../gcp && terraform destroy
 
 ## Apéndice — Problemas ya resueltos (para no repetir la investigación)
 
-### Error SSL: `certificate verify failed: unable to get local issuer certificate` (aws-cli)
-Proxy corporativo con inspección SSL (Zscaler, Netskope, etc.). `aws-cli` no confía en su certificado por defecto.
-1. Exporta el certificado raíz del proxy desde el navegador (candado → ver certificado → Exportar → Base-64 X.509).
-2. Descarga https://curl.se/ca/cacert.pem, pega el certificado del proxy al final, guarda como `aws-ca-bundle.pem`.
-3. `export AWS_CA_BUNDLE="/c/Users/<tu_usuario>/aws-ca-bundle.pem"` (agrégalo a `~/.bashrc`).
+### Error SSL: `certificate verify failed` (aws-cli)
+Proxy corporativo con inspección SSL. 1) Exporta el certificado raíz del proxy desde el navegador (candado → ver certificado → Exportar → Base-64 X.509). 2) Descarga https://curl.se/ca/cacert.pem, pega el certificado del proxy al final, guarda como `aws-ca-bundle.pem`. 3) `export AWS_CA_BUNDLE="/c/Users/<tu_usuario>/aws-ca-bundle.pem"` (agrégalo a `~/.bashrc`).
 
 ### `gcloud` + certificado corporativo: `certificate verify failed`
-Mismo proxy, `gcloud` no usa `AWS_CA_BUNDLE` — usa su propia config, pero reutiliza el mismo archivo:
+Mismo proxy, `gcloud` no usa `AWS_CA_BUNDLE` — usa su propia config, reutilizando el mismo archivo:
 ```bash
 gcloud config set core/custom_ca_certs_file "/c/Users/<tu_usuario>/aws-ca-bundle.pem"
 ```
-Config persistente (no una variable de sesión), no hay que repetirla en cada terminal.
 
 ### `curl` directo a HTTPS también falla con el mismo error SSL
-Tercera herramienta, mismo proxy. Solo pasa contra HTTPS (por eso no lo viste probando contra AWS, que expone HTTP plano) — sí te pasa contra Cloud Run.
+Solo pasa contra HTTPS (por eso no lo viste probando contra AWS, que expone HTTP plano) — sí te pasa contra Cloud Run.
 ```bash
 export CURL_CA_BUNDLE="/c/Users/<tu_usuario>/aws-ca-bundle.pem"
-echo 'export CURL_CA_BUNDLE="/c/Users/<tu_usuario>/aws-ca-bundle.pem"' >> ~/.bashrc
 ```
-O puntual, sin dejarlo persistente: `curl --cacert "/c/Users/<tu_usuario>/aws-ca-bundle.pem" ...`
+O puntual: `curl --cacert "/c/Users/<tu_usuario>/aws-ca-bundle.pem" ...`
+
+### `docker push` a ECR falla con `denied: Your authorization token has expired`
+El login de Docker a ECR expira cada ~12h. Repite: `aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com`
+
+### `service-a` no arranca con `ModuleNotFoundError: No module named 'pkg_resources'`
+`opentelemetry-instrumentation` (base de `-fastapi` y `-requests`) importa `pkg_resources`, que viene de `setuptools` — no de Python. `pip` moderno y `python:3.12-slim` no lo instalan solo. Solución: agregar `setuptools` explícito al `requirements.txt`.
 
 ### Error `InvalidClientTokenId`
-El perfil `default` de AWS CLI tiene una Access Key inválida. Si VS Code muestra "Connected" con un perfil con nombre, usa ese:
-```bash
-export AWS_PROFILE=<tu-perfil-bueno>
-```
+El perfil `default` de AWS CLI tiene una Access Key inválida. Usa el perfil con nombre que sí funciona: `export AWS_PROFILE=<tu-perfil-bueno>`
 
 ### El repositorio de ECR/Artifact Registry se crea fuera de Terraform, a propósito
-Evita el problema de "quién lo crea primero" (necesitas el repo para el `docker push`, pero antes de tener nada que desplegar). Terraform solo lo referencia como recurso existente (`data` source), nunca lo crea ni lo destruye.
+Evita el problema de "quién lo crea primero". Terraform solo lo referencia (`data` source), nunca lo crea ni lo destruye.
 
 ### El Collector crashea con `cannot resolve the configuration: retrieved value (type=string) cannot be used as a Conf`
-Causa: una variable `${env:VAR}` usada como elemento suelto dentro de una lista YAML (ej. `exporters: [${env:LOG_EXPORTER}, debug]`) en vez de como valor completo de un campo. Solución adoptada en este repo: dos archivos de config completos (uno por nube) horneados en la misma imagen, seleccionados por `command`/`args` desde Terraform.
+Causa: una variable `${env:VAR}` como elemento suelto dentro de una lista YAML, en vez de valor completo de un campo. Solución: dos archivos de config completos (uno por nube), seleccionados por `command`/`args` desde Terraform.
 
-Para diagnosticar sin gastar en ciclos de despliegue: reprodúcelo en local con `docker run`. Si el log sale cortado, usa `docker run -d --name debug ... && docker logs debug` en vez de `--rm` en primer plano.
+Para diagnosticar sin gastar en despliegues: reprodúcelo en local con `docker run`. Si el log sale cortado, usa `docker run -d --name debug ... && docker logs debug` en vez de `--rm`.
 
 ### El Collector no arranca con `invalid configuration: exporters::<algo>: '<campo>' must be set`
-Causa: **el Collector valida TODOS los exporters declarados en el YAML, incluso los que no están referenciados en ningún pipeline activo**. Si declaras un exporter (ej. `awscloudwatchlogs` en la config de GCP) con un campo obligatorio que depende de una variable nunca seteada en esa nube, el Collector no arranca — ni abre el puerto OTLP. En Cloud Run esto se ve como "el contenedor no escuchó a tiempo" (mensaje engañoso).
+El Collector valida **todos** los exporters declarados, incluso los no usados en ningún pipeline. Solución: cada config solo declara los exporters que esa nube realmente usa.
 
-Solución: cada archivo de config solo debe declarar los exporters que esa nube realmente usa — quita el bloque que no corresponde, no lo dejes "por si acaso".
-
-### Las peticiones a Cloud Run responden con HTTP 415 (Unsupported Media Type)
-Causa: Cloud Run solo expone UN puerto por servicio. Si ese puerto es `4317`/`h2c` (gRPC) pero mandas JSON por HTTP/1.1 (como los `curl` de este README), el receiver equivocado recibe la petición y la rechaza. Solución adoptada: exponer `4318` (HTTP) en vez de `4317` en `terraform/gcp/main.tf`.
+### Las peticiones a Cloud Run responden con HTTP 415
+Cloud Run solo expone un puerto. `4317`/`h2c` es gRPC; nuestros `curl` mandan JSON por HTTP/1.1, que necesita `4318`. Solución: exponer `4318` en `terraform/gcp/main.tf`.
 
 ### `gcloud projects create` falla con "exceeded your allotted project quota"
-Ya cubierto en el Paso 1 de la sección GCP — usa el proyecto por defecto en vez de pelear con la cuota.
+Ya cubierto en GCP → Paso 0 — usa el proyecto por defecto.
 
 ### `terraform apply` en GCP falla con "could not find default credentials"
-Ya cubierto en el Paso 4 de la sección GCP — usa una cuenta de servicio en vez de `gcloud auth application-default login`.
+Ya cubierto en GCP → Paso 0 — usa la cuenta de servicio.
 
 ### Una traza de prueba llega al Collector (`partialSuccess`) pero no aparece en X-Ray
-Ver el Paso 5 de AWS — es el formato del `traceId`, X-Ray exige que los primeros 8 caracteres hex sean la fecha/hora Unix actual, y descarta en silencio cualquier traza que no cumpla eso.
+El formato del `traceId` — ver AWS → Paso 3.
 
 ### El tag `latest` no dispara redeploy automático en ECS
-Terraform compara el texto de la variable `collector_image`, no el contenido real de la imagen. Fuerza el redeploy manualmente (ver sección AWS, paso 6).
+Fuerza el redeploy manualmente con `--force-new-deployment` (ver AWS → Paso 2).
 
 ### El Collector crashea con `listen tcp 0.0.0.0:4317: bind: address already in use`
-Causa: Jaeger, con `COLLECTOR_OTLP_ENABLED=true`, levanta su propio receptor OTLP en los mismos puertos que el Collector (4317/4318) — si comparten red (misma ECS Task), chocan. **Ya no aplica** en este repo (Jaeger y Prometheus corren en sus propias tareas, cada una con su propio ENI, sin conflicto de puertos) — se deja documentado por si alguna vez vuelves a compartir tareas por razones de costo.
+Pasaba cuando Jaeger compartía tarea con el Collector (ya no aplica — cada uno tiene su propia tarea/ENI). Se deja documentado por si vuelves a compartir tareas por costo.

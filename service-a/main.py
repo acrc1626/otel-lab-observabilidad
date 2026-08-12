@@ -15,14 +15,27 @@ import logging
 import requests
 from fastapi import FastAPI, HTTPException
 
-from opentelemetry import trace
+from opentelemetry import trace, metrics
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
+from opentelemetry.sdk.resources import Resource, SERVICE_NAME
 from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 
-trace.set_tracer_provider(TracerProvider())
-trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+_resource = Resource.create({SERVICE_NAME: "service-a"})
+
+# Endpoint leído desde OTEL_EXPORTER_OTLP_ENDPOINT
+trace.set_tracer_provider(TracerProvider(resource=_resource))
+trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+
+metrics.set_meter_provider(MeterProvider(
+    resource=_resource,
+    metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter())],
+))
 
 # --- Logging estructurado básico (se refinará a JSON con trace_id en Fase 1) ---
 logging.basicConfig(level=logging.INFO)
