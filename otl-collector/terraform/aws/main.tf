@@ -105,6 +105,15 @@ resource "aws_ecs_cluster" "this" {
   name = "otel-lab-cluster"
 }
 
+# --- Namespace de Cloud Map para Service Connect: DNS privado dentro de la VPC.
+# Con esto, "otel-collector.otel-lab.internal" siempre resuelve a la tarea
+# actual del Collector, sin importar cuántas veces se recree — elimina el
+# problema de tener que rastrear y volver a pasar la IP a mano cada vez.
+resource "aws_service_discovery_private_dns_namespace" "otel_lab" {
+  name = "otel-lab.internal"
+  vpc  = data.aws_vpc.default.id
+}
+
 # --- Repositorio de imágenes: se crea a mano (aws ecr create-repository), acá solo se referencia ---
 data "aws_ecr_repository" "otel_collector" {
   name = "otel-collector"
@@ -195,13 +204,14 @@ resource "aws_ecs_task_definition" "otel_collector" {
       command   = ["--config=/etc/otel-collector-config-aws.yaml"]
       portMappings = [
         { containerPort = 4317, protocol = "tcp" },
-        { containerPort = 4318, protocol = "tcp" },
+        { containerPort = 4318, protocol = "tcp", name = "otlp-http" },
         { containerPort = 13133, protocol = "tcp" }
       ]
       environment = [
         { name = "CLOUD_PROVIDER", value = "aws" },
         { name = "DEPLOYMENT_ENV", value = "lab" },
-        { name = "PROMETHEUS_REMOTE_WRITE_ENDPOINT", value = "http://${var.prometheus_public_ip}:9090/api/v1/write" },
+        # DNS interno de Service Connect en vez de una IP que puede cambiar.
+        { name = "PROMETHEUS_REMOTE_WRITE_ENDPOINT", value = "http://prometheus.otel-lab.internal:9090/api/v1/write" },
         { name = "PROMETHEUS_TLS_INSECURE", value = "true" },
         { name = "CLOUDWATCH_LOG_GROUP", value = aws_cloudwatch_log_group.collector_data.name },
         { name = "CLOUDWATCH_LOG_STREAM", value = "collector-aws" },
@@ -230,6 +240,22 @@ resource "aws_ecs_service" "otel_collector" {
     subnets          = data.aws_subnets.default.ids
     security_groups  = [aws_security_group.observability.id]
     assign_public_ip = true
+  }
+
+  # Servidor: se registra como "otel-collector.otel-lab.internal" para que
+  # service-a lo encuentre. También actúa como cliente (sin bloque "service"
+  # extra) para poder resolver "prometheus.otel-lab.internal" él mismo.
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_private_dns_namespace.otel_lab.arn
+
+    service {
+      port_name      = "otlp-http"
+      discovery_name = "otel-collector"
+      client_alias {
+        port = 4318
+      }
+    }
   }
 }
 
@@ -306,7 +332,7 @@ resource "aws_ecs_task_definition" "prometheus" {
       image     = "prom/prometheus:latest"
       essential = true
       portMappings = [
-        { containerPort = 9090, protocol = "tcp" }
+        { containerPort = 9090, protocol = "tcp", name = "prom-http" }
       ]
       command = [
         "--config.file=/etc/prometheus/prometheus.yml",
@@ -336,6 +362,21 @@ resource "aws_ecs_service" "prometheus" {
     security_groups  = [aws_security_group.observability.id]
     assign_public_ip = true
   }
+
+  # Servidor: se registra como "prometheus.otel-lab.internal" para que el
+  # Collector y Grafana lo encuentren sin necesitar su IP pública.
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_private_dns_namespace.otel_lab.arn
+
+    service {
+      port_name      = "prom-http"
+      discovery_name = "prometheus"
+      client_alias {
+        port = 9090
+      }
+    }
+  }
 }
 
 # ============================================================
@@ -362,10 +403,9 @@ resource "aws_ecs_task_definition" "service_a" {
         { containerPort = 8000, protocol = "tcp" }
       ]
       environment = [
-        # El SDK de OTel le agrega automáticamente /v1/traces y /v1/metrics a esta
-        # base — no hace falta (ni hay que) escribir la ruta completa como en los
-        # curl manuales.
-        { name = "OTEL_EXPORTER_OTLP_ENDPOINT", value = "http://${var.collector_public_ip}:4318" },
+        # DNS interno de Service Connect en vez de la IP pública del Collector,
+        # que cambiaba cada vez que la tarea se recreaba.
+        { name = "OTEL_EXPORTER_OTLP_ENDPOINT", value = "http://otel-collector.otel-lab.internal:4318" },
         { name = "SERVICE_B_URL", value = var.service_b_url }
       ]
       logConfiguration = {
@@ -391,6 +431,13 @@ resource "aws_ecs_service" "service_a" {
     subnets          = data.aws_subnets.default.ids
     security_groups  = [aws_security_group.observability.id]
     assign_public_ip = true
+  }
+
+  # Solo cliente: necesita resolver "otel-collector.otel-lab.internal", pero
+  # nadie internamente necesita encontrar a service-a (nada de bloque "service").
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_private_dns_namespace.otel_lab.arn
   }
 }
 
@@ -448,18 +495,14 @@ resource "aws_ecs_service" "grafana" {
     security_groups  = [aws_security_group.observability.id]
     assign_public_ip = true
   }
-}
 
-variable "prometheus_public_ip" {
-  description = "IP pública de la tarea de Prometheus. Fargate la asigna en tiempo de ejecución, así que en el primer apply (cuando Prometheus todavía no existe) pasa un valor cualquiera (ej. '0.0.0.0'); después de que Prometheus esté corriendo, saca su IP real con el output get_prometheus_public_ip_command y vuelve a aplicar para que el Collector apunte a la IP correcta."
-  type        = string
-  default     = "0.0.0.0"
-}
-
-variable "collector_public_ip" {
-  description = "IP pública de la tarea del Collector. Mismo patrón que prometheus_public_ip: no existe hasta el primer apply, así que arranca con un valor de relleno y se corrige en un apply posterior con la IP real (terraform output get_collector_public_ip_command)."
-  type        = string
-  default     = "0.0.0.0"
+  # Solo cliente: para que el datasource de Prometheus en la UI de Grafana
+  # pueda usar "http://prometheus.otel-lab.internal:9090" en vez de la IP
+  # pública, que se rompía cada vez que Prometheus se recreaba.
+  service_connect_configuration {
+    enabled   = true
+    namespace = aws_service_discovery_private_dns_namespace.otel_lab.arn
+  }
 }
 
 variable "service_a_image" {
@@ -496,7 +539,7 @@ output "get_jaeger_public_ip_command" {
 }
 
 output "get_prometheus_public_ip_command" {
-  description = "IP pública de la tarea de Prometheus. La necesita este mismo módulo (variable prometheus_public_ip, para el segundo apply) y GCP (variable aws_prometheus_public_ip)."
+  description = "IP pública de la tarea de Prometheus. Ya no la necesita este módulo (el Collector le habla por DNS interno de Service Connect) — solo hace falta para GCP (variable aws_prometheus_public_ip) y para que tú la consultes desde tu navegador."
   value = "aws ecs describe-tasks --cluster ${aws_ecs_cluster.this.name} --tasks $(aws ecs list-tasks --cluster ${aws_ecs_cluster.this.name} --service-name prometheus --query 'taskArns[0]' --output text) --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text | xargs -I{} aws ec2 describe-network-interfaces --network-interface-ids {} --query 'NetworkInterfaces[0].Association.PublicIp' --output text"
 }
 
