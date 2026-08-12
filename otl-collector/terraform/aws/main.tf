@@ -37,9 +37,11 @@ data "aws_subnets" "default" {
   }
 }
 
-resource "aws_security_group" "otel_collector" {
-  name        = "otel-collector-sg"
-  description = "Permite OTLP (4317/4318), healthcheck (13133), Jaeger UI (16686) y Prometheus UI (9090)"
+# --- Security group compartido por las 3 tareas (cada una tiene su propio ENI,
+# así que no hay conflicto de puertos aunque todas usen el mismo SG) ---
+resource "aws_security_group" "observability" {
+  name        = "otel-observability-sg"
+  description = "Puertos del Collector, Jaeger y Prometheus (lab)"
   vpc_id      = data.aws_vpc.default.id
 
   ingress {
@@ -51,7 +53,7 @@ resource "aws_security_group" "otel_collector" {
   }
 
   ingress {
-    description = "Healthcheck - abierto a internet solo para el lab, no usar asi en produccion"
+    description = "Healthcheck del Collector - abierto a internet solo para el lab, no usar asi en produccion"
     from_port   = 13133
     to_port     = 13133
     protocol    = "tcp"
@@ -59,7 +61,7 @@ resource "aws_security_group" "otel_collector" {
   }
 
   ingress {
-    description = "Jaeger UI (abierto a internet solo para el lab, no usar asi en produccion)"
+    description = "Jaeger UI - abierto a internet solo para el lab, no usar asi en produccion"
     from_port   = 16686
     to_port     = 16686
     protocol    = "tcp"
@@ -67,7 +69,7 @@ resource "aws_security_group" "otel_collector" {
   }
 
   ingress {
-    description = "Prometheus UI (abierto a internet solo para el lab, no usar asi en produccion)"
+    description = "Prometheus UI y remote-write - abierto a internet solo para el lab, no usar asi en produccion"
     from_port   = 9090
     to_port     = 9090
     protocol    = "tcp"
@@ -92,18 +94,18 @@ data "aws_ecr_repository" "otel_collector" {
   name = "otel-collector"
 }
 
-# --- 1. Log groups ---
+# --- Log groups (uno para el Collector, uno compartido para Jaeger/Prometheus) ---
 resource "aws_cloudwatch_log_group" "collector_data" {
   name              = "/otel/collector"
   retention_in_days = 14
 }
 
 resource "aws_cloudwatch_log_group" "ecs_task_logs" {
-  name              = "/ecs/otel-collector"
+  name              = "/ecs/otel-observability"
   retention_in_days = 14
 }
 
-# --- 2. IAM: rol de ejecución (pull de imagen, logs del propio ECS) ---
+# --- IAM: rol de ejecución, compartido por las 3 tareas (pull de imagen, logs) ---
 resource "aws_iam_role" "ecs_task_execution_role" {
   name = "ecsTaskExecutionRole-otel"
   assume_role_policy = jsonencode({
@@ -121,7 +123,9 @@ resource "aws_iam_role_policy_attachment" "ecs_task_execution_role_policy" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# --- 3. IAM: rol de la tarea (permisos para que el Collector escriba en CloudWatch Logs) ---
+# --- IAM: rol de la tarea del Collector — CloudWatch Logs + X-Ray.
+# Solo el Collector necesita este rol (llama a AWS APIs directamente);
+# Jaeger y Prometheus no llaman a ninguna API de AWS, no necesitan task role propio.
 resource "aws_iam_role" "otel_collector_task_role" {
   name = "otelCollectorTaskRole"
   assume_role_policy = jsonencode({
@@ -147,15 +151,23 @@ resource "aws_iam_role_policy" "otel_collector_task_policy" {
   })
 }
 
-# --- 4. Task Definition: Collector + Jaeger + Prometheus en la misma tarea ---
-# En awsvpc todos los contenedores comparten red, así que se hablan por localhost.
-# Esto evita depender de un endpoint externo en GCP mientras resuelves ese acceso.
+# Permisos para que el exporter "awsxray" del Collector pueda mandar trazas a X-Ray.
+resource "aws_iam_role_policy_attachment" "otel_collector_xray" {
+  role       = aws_iam_role.otel_collector_task_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
+}
+
+# ============================================================
+# Servicio 1: OTel Collector — recibe de los microservicios de AWS
+# (y del Collector de GCP no, ver terraform/gcp: GCP le exporta
+# directo a Jaeger/Prometheus, no a este Collector)
+# ============================================================
 resource "aws_ecs_task_definition" "otel_collector" {
   family                   = "otel-collector"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = "1024" # subido de 256 a 1024 porque ahora corren 3 contenedores
-  memory                   = "2048" # subido de 512 a 2048 por la misma razón
+  cpu                      = "256"
+  memory                   = "512"
   execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
   task_role_arn             = aws_iam_role.otel_collector_task_role.arn
 
@@ -164,9 +176,7 @@ resource "aws_ecs_task_definition" "otel_collector" {
       name      = "otel-collector"
       image     = var.collector_image
       essential = true
-      # Misma imagen que en GCP; le decimos explícitamente que cargue la config de AWS
-      # (awscloudwatchlogs como exporter de logs) en vez de dejarlo al default del Dockerfile.
-      command = ["--config=/etc/otel-collector-config-aws.yaml"]
+      command   = ["--config=/etc/otel-collector-config-aws.yaml"]
       portMappings = [
         { containerPort = 4317, protocol = "tcp" },
         { containerPort = 4318, protocol = "tcp" },
@@ -175,9 +185,7 @@ resource "aws_ecs_task_definition" "otel_collector" {
       environment = [
         { name = "CLOUD_PROVIDER", value = "aws" },
         { name = "DEPLOYMENT_ENV", value = "lab" },
-        { name = "JAEGER_OTLP_ENDPOINT", value = "localhost:5317" },
-        { name = "JAEGER_TLS_INSECURE", value = "true" },
-        { name = "PROMETHEUS_REMOTE_WRITE_ENDPOINT", value = "http://localhost:9090/api/v1/write" },
+        { name = "PROMETHEUS_REMOTE_WRITE_ENDPOINT", value = "http://${var.prometheus_public_ip}:9090/api/v1/write" },
         { name = "PROMETHEUS_TLS_INSECURE", value = "true" },
         { name = "CLOUDWATCH_LOG_GROUP", value = aws_cloudwatch_log_group.collector_data.name },
         { name = "CLOUDWATCH_LOG_STREAM", value = "collector-aws" },
@@ -191,23 +199,51 @@ resource "aws_ecs_task_definition" "otel_collector" {
           "awslogs-stream-prefix" = "otel"
         }
       }
-    },
+    }
+  ])
+}
+
+resource "aws_ecs_service" "otel_collector" {
+  name            = "otel-collector"
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.otel_collector.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = data.aws_subnets.default.ids
+    security_groups  = [aws_security_group.observability.id]
+    assign_public_ip = true
+  }
+}
+
+# ============================================================
+# Servicio 2: Jaeger — standalone, propia tarea/ENI. Recibe trazas
+# del Collector de GCP directamente (según la actividad, Jaeger es
+# la herramienta de trazas asociada a GCP). Vive en AWS solo como
+# infraestructura, no está atado a los microservicios de AWS.
+# ============================================================
+resource "aws_ecs_task_definition" "jaeger" {
+  family                   = "jaeger"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+  # Sin task_role_arn: Jaeger no llama a ninguna API de AWS por su cuenta.
+
+  container_definitions = jsonencode([
     {
-      # Jaeger, con COLLECTOR_OTLP_ENABLED=true, levanta su propio receptor OTLP —
-      # por defecto en los MISMOS puertos que el Collector (4317/4318). Como comparten
-      # red (misma tarea), eso choca ("address already in use"). Se mueve el de Jaeger
-      # a 5317/5318 para que 4317/4318 queden libres para el Collector, que es el que
-      # recibe tráfico de afuera (service-a/service-b).
       name      = "jaeger"
       image     = "jaegertracing/all-in-one:1.60"
       essential = true
       portMappings = [
-        { containerPort = 16686, protocol = "tcp" } # UI, la única que necesita salir
+        { containerPort = 16686, protocol = "tcp" }, # UI
+        { containerPort = 4317, protocol = "tcp" },  # OTLP gRPC — libre de conflicto, tarea propia
+        { containerPort = 4318, protocol = "tcp" }   # OTLP HTTP
       ]
       environment = [
-        { name = "COLLECTOR_OTLP_ENABLED", value = "true" },
-        { name = "COLLECTOR_OTLP_GRPC_HOST_PORT", value = ":5317" },
-        { name = "COLLECTOR_OTLP_HTTP_HOST_PORT", value = ":5318" }
+        { name = "COLLECTOR_OTLP_ENABLED", value = "true" }
       ]
       logConfiguration = {
         logDriver = "awslogs"
@@ -217,7 +253,38 @@ resource "aws_ecs_task_definition" "otel_collector" {
           "awslogs-stream-prefix" = "jaeger"
         }
       }
-    },
+    }
+  ])
+}
+
+resource "aws_ecs_service" "jaeger" {
+  name            = "jaeger"
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.jaeger.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = data.aws_subnets.default.ids
+    security_groups  = [aws_security_group.observability.id]
+    assign_public_ip = true
+  }
+}
+
+# ============================================================
+# Servicio 3: Prometheus — standalone, propia tarea/ENI. Backend
+# de métricas centralizado y compartido: recibe remote_write tanto
+# del Collector de AWS como del Collector de GCP.
+# ============================================================
+resource "aws_ecs_task_definition" "prometheus" {
+  family                   = "prometheus"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+
+  container_definitions = jsonencode([
     {
       name      = "prometheus"
       image     = "prom/prometheus:latest"
@@ -227,7 +294,7 @@ resource "aws_ecs_task_definition" "otel_collector" {
       ]
       command = [
         "--config.file=/etc/prometheus/prometheus.yml",
-        "--web.enable-remote-write-receiver" # necesario para que el Collector le haga push por remote_write
+        "--web.enable-remote-write-receiver"
       ]
       logConfiguration = {
         logDriver = "awslogs"
@@ -241,19 +308,24 @@ resource "aws_ecs_task_definition" "otel_collector" {
   ])
 }
 
-# --- 5. Service ---
-resource "aws_ecs_service" "otel_collector" {
-  name            = "otel-collector"
+resource "aws_ecs_service" "prometheus" {
+  name            = "prometheus"
   cluster         = aws_ecs_cluster.this.id
-  task_definition = aws_ecs_task_definition.otel_collector.arn
+  task_definition = aws_ecs_task_definition.prometheus.arn
   desired_count   = 1
   launch_type     = "FARGATE"
 
   network_configuration {
     subnets          = data.aws_subnets.default.ids
-    security_groups  = [aws_security_group.otel_collector.id]
+    security_groups  = [aws_security_group.observability.id]
     assign_public_ip = true
   }
+}
+
+variable "prometheus_public_ip" {
+  description = "IP pública de la tarea de Prometheus. Fargate la asigna en tiempo de ejecución, así que en el primer apply (cuando Prometheus todavía no existe) pasa un valor cualquiera (ej. '0.0.0.0'); después de que Prometheus esté corriendo, saca su IP real con el output get_prometheus_public_ip_command y vuelve a aplicar para que el Collector apunte a la IP correcta."
+  type        = string
+  default     = "0.0.0.0"
 }
 
 output "ecr_repository_url" {
@@ -268,7 +340,17 @@ output "ecs_cluster_name" {
   value = aws_ecs_cluster.this.name
 }
 
-output "get_public_ip_command" {
-  description = "Fargate asigna la IP pública en tiempo de ejecución, no es un valor fijo de Terraform. Corre esto después del apply para obtenerla."
+output "get_collector_public_ip_command" {
+  description = "IP pública de la tarea del Collector."
   value = "aws ecs describe-tasks --cluster ${aws_ecs_cluster.this.name} --tasks $(aws ecs list-tasks --cluster ${aws_ecs_cluster.this.name} --service-name otel-collector --query 'taskArns[0]' --output text) --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text | xargs -I{} aws ec2 describe-network-interfaces --network-interface-ids {} --query 'NetworkInterfaces[0].Association.PublicIp' --output text"
+}
+
+output "get_jaeger_public_ip_command" {
+  description = "IP pública de la tarea de Jaeger. Esta es la que necesita GCP en su variable aws_jaeger_public_ip."
+  value = "aws ecs describe-tasks --cluster ${aws_ecs_cluster.this.name} --tasks $(aws ecs list-tasks --cluster ${aws_ecs_cluster.this.name} --service-name jaeger --query 'taskArns[0]' --output text) --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text | xargs -I{} aws ec2 describe-network-interfaces --network-interface-ids {} --query 'NetworkInterfaces[0].Association.PublicIp' --output text"
+}
+
+output "get_prometheus_public_ip_command" {
+  description = "IP pública de la tarea de Prometheus. La necesita este mismo módulo (variable prometheus_public_ip, para el segundo apply) y GCP (variable aws_prometheus_public_ip)."
+  value = "aws ecs describe-tasks --cluster ${aws_ecs_cluster.this.name} --tasks $(aws ecs list-tasks --cluster ${aws_ecs_cluster.this.name} --service-name prometheus --query 'taskArns[0]' --output text) --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text | xargs -I{} aws ec2 describe-network-interfaces --network-interface-ids {} --query 'NetworkInterfaces[0].Association.PublicIp' --output text"
 }

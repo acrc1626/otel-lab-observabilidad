@@ -1,7 +1,11 @@
 # Config del OTel Collector para GCP. Misma imagen que otel-collector-config-aws.yaml,
-# solo difiere en el exporter de logs (aquí: googlecloud). El orquestador (ECS/K8s)
-# elige cuál cargar pasando --config=<este archivo o el de aws> como command override —
-# NO se controla con una variable de entorno dentro del YAML (eso causó un crash, ver git log).
+# solo difiere en el exporter de logs (aquí: googlecloud) y en que las trazas SÍ van a
+# Jaeger (según la actividad, Jaeger es específicamente para GCP; AWS usa X-Ray).
+# El endpoint de Jaeger (JAEGER_OTLP_ENDPOINT) apunta DIRECTO a la IP pública de la
+# tarea de Jaeger en AWS — ya no se enruta a través del Collector de AWS como antes.
+# El orquestador (ECS/K8s) elige esta config vs. la de AWS pasando
+# --config=<este archivo o el de aws> como command override —
+# NO se controla con una variable de entorno dentro del YAML (eso causó un crash, ver apéndice del README).
 receivers:
   otlp:
     protocols:
@@ -30,7 +34,7 @@ processors:
     send_batch_size: 512
 
 exporters:
-  # Trazas -> Jaeger centralizado (desplegado en GKE, ver k8s/jaeger.yaml)
+  # Trazas -> Jaeger, que corre en su propia tarea de ECS en AWS (ver terraform/aws)
   otlp/jaeger:
     endpoint: ${env:JAEGER_OTLP_ENDPOINT}
     tls:
@@ -42,14 +46,9 @@ exporters:
     tls:
       insecure: ${env:PROMETHEUS_TLS_INSECURE}
 
-  # Logs -> destino específico de cada nube (uno de los dos bloques de abajo aplica según despliegue)
+  # Logs -> Cloud Logging
   googlecloud:
     project: ${env:GCP_PROJECT_ID}
-
-  awscloudwatchlogs:
-    log_group_name: ${env:CLOUDWATCH_LOG_GROUP}
-    log_stream_name: ${env:CLOUDWATCH_LOG_STREAM}
-    region: ${env:AWS_REGION}
 
   # Útil mientras depuras localmente
   debug:

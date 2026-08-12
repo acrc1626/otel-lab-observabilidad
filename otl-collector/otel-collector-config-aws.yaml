@@ -1,7 +1,9 @@
-# Config del OTel Collector para AWS. Misma imagen que otel-collector-config-gcp.yaml,
-# solo difiere en el exporter de logs (aquí: awscloudwatchlogs). El orquestador (ECS/K8s)
-# elige cuál cargar pasando --config=<este archivo o el de gcp> como command override —
-# NO se controla con una variable de entorno dentro del YAML (eso causó un crash, ver git log).
+# Config del OTel Collector para AWS. Trazas van a AWS X-Ray (no Jaeger — según la
+# actividad, Jaeger es específicamente para GCP). Métricas van a un Prometheus
+# centralizado que corre en su propia tarea de ECS (no comparte tarea con este
+# Collector). El orquestador (ECS/K8s) elige esta config vs. la de GCP pasando
+# --config=<este archivo o el de gcp> como command override — NO se controla con
+# una variable de entorno dentro del YAML (eso causó un crash, ver apéndice del README).
 receivers:
   otlp:
     protocols:
@@ -30,22 +32,17 @@ processors:
     send_batch_size: 512
 
 exporters:
-  # Trazas -> Jaeger centralizado (desplegado en GKE, ver k8s/jaeger.yaml)
-  otlp/jaeger:
-    endpoint: ${env:JAEGER_OTLP_ENDPOINT}
-    tls:
-      insecure: ${env:JAEGER_TLS_INSECURE}
+  # Trazas -> AWS X-Ray (servicio nativo, no un contenedor que despliegues tú)
+  awsxray:
+    region: ${env:AWS_REGION}
 
-  # Métricas -> Prometheus vía remote write (push, evita scrape cross-cloud)
+  # Métricas -> Prometheus centralizado, en su propia tarea de ECS (ya no localhost)
   prometheusremotewrite:
     endpoint: ${env:PROMETHEUS_REMOTE_WRITE_ENDPOINT}
     tls:
       insecure: ${env:PROMETHEUS_TLS_INSECURE}
 
-  # Logs -> destino específico de cada nube (uno de los dos bloques de abajo aplica según despliegue)
-  googlecloud:
-    project: ${env:GCP_PROJECT_ID}
-
+  # Logs -> CloudWatch
   awscloudwatchlogs:
     log_group_name: ${env:CLOUDWATCH_LOG_GROUP}
     log_stream_name: ${env:CLOUDWATCH_LOG_STREAM}
@@ -65,7 +62,7 @@ service:
     traces:
       receivers: [otlp]
       processors: [memory_limiter, resource, batch]
-      exporters: [otlp/jaeger, debug]
+      exporters: [awsxray, debug]
 
     metrics:
       receivers: [otlp]
@@ -75,7 +72,4 @@ service:
     logs:
       receivers: [otlp]
       processors: [memory_limiter, resource, batch]
-      # Fijo a AWS por ahora (ver nota abajo). ${env:VAR} como elemento suelto de una
-      # lista rompe el resolver de config de OTel Collector con "cannot be used as a Conf" —
-      # a diferencia de usarlo como valor completo de un campo (key: ${env:VAR}), que sí funciona.
       exporters: [awscloudwatchlogs, debug]
