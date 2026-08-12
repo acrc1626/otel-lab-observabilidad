@@ -84,6 +84,14 @@ resource "aws_security_group" "observability" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  ingress {
+    description = "Grafana UI - abierto a internet solo para el lab, no usar asi en produccion"
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   egress {
     from_port   = 0
     to_port     = 0
@@ -386,6 +394,62 @@ resource "aws_ecs_service" "service_a" {
   }
 }
 
+# ============================================================
+# Servicio 5: Grafana — para consultar/visualizar Prometheus.
+# Imagen oficial sin modificar, igual que Jaeger/Prometheus.
+# El dashboard en sí (los 6 paneles que pide la actividad) es
+# trabajo de Alex en la Fase 3 — esto solo deja Grafana desplegado
+# y conectado, listo para que él lo use.
+# ============================================================
+resource "aws_ecs_task_definition" "grafana" {
+  family                   = "grafana"
+  requires_compatibilities = ["FARGATE"]
+  network_mode             = "awsvpc"
+  cpu                      = "256"
+  memory                   = "512"
+  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+
+  container_definitions = jsonencode([
+    {
+      name      = "grafana"
+      image     = "grafana/grafana:latest"
+      essential = true
+      portMappings = [
+        { containerPort = 3000, protocol = "tcp" }
+      ]
+      environment = [
+        # Credenciales por defecto (admin/admin) — cámbialas al primer login.
+        # Es un lab con security group abierto a internet, no dejes esto así
+        # en un entorno real.
+        { name = "GF_SECURITY_ADMIN_USER", value = "admin" },
+        { name = "GF_SECURITY_ADMIN_PASSWORD", value = "admin" }
+      ]
+      logConfiguration = {
+        logDriver = "awslogs"
+        options = {
+          "awslogs-group"         = aws_cloudwatch_log_group.ecs_task_logs.name
+          "awslogs-region"        = var.region
+          "awslogs-stream-prefix" = "grafana"
+        }
+      }
+    }
+  ])
+}
+
+resource "aws_ecs_service" "grafana" {
+  name            = "grafana"
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.grafana.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = data.aws_subnets.default.ids
+    security_groups  = [aws_security_group.observability.id]
+    assign_public_ip = true
+  }
+}
+
 variable "prometheus_public_ip" {
   description = "IP pública de la tarea de Prometheus. Fargate la asigna en tiempo de ejecución, así que en el primer apply (cuando Prometheus todavía no existe) pasa un valor cualquiera (ej. '0.0.0.0'); después de que Prometheus esté corriendo, saca su IP real con el output get_prometheus_public_ip_command y vuelve a aplicar para que el Collector apunte a la IP correcta."
   type        = string
@@ -439,4 +503,9 @@ output "get_prometheus_public_ip_command" {
 output "get_service_a_public_ip_command" {
   description = "IP pública de la tarea de service-a — úsala para pegarle a /health y /order desde afuera."
   value = "aws ecs describe-tasks --cluster ${aws_ecs_cluster.this.name} --tasks $(aws ecs list-tasks --cluster ${aws_ecs_cluster.this.name} --service-name service-a --query 'taskArns[0]' --output text) --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text | xargs -I{} aws ec2 describe-network-interfaces --network-interface-ids {} --query 'NetworkInterfaces[0].Association.PublicIp' --output text"
+}
+
+output "get_grafana_public_ip_command" {
+  description = "IP pública de la tarea de Grafana."
+  value = "aws ecs describe-tasks --cluster ${aws_ecs_cluster.this.name} --tasks $(aws ecs list-tasks --cluster ${aws_ecs_cluster.this.name} --service-name grafana --query 'taskArns[0]' --output text) --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value' --output text | xargs -I{} aws ec2 describe-network-interfaces --network-interface-ids {} --query 'NetworkInterfaces[0].Association.PublicIp' --output text"
 }
