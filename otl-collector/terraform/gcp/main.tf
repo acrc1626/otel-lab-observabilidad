@@ -34,6 +34,11 @@ variable "aws_prometheus_public_ip" {
   type        = string
 }
 
+variable "service_b_image" {
+  description = "Imagen de service-b ya publicada en Artifact Registry (docker build + push, este módulo no la construye)."
+  type        = string
+}
+
 provider "google" {
   project = var.project_id
   region  = var.region
@@ -154,6 +159,70 @@ resource "google_cloud_run_v2_service_iam_member" "public_access" {
   name     = google_cloud_run_v2_service.otel_collector.name
   role     = "roles/run.invoker"
   member   = "allUsers"
+}
+
+# --- service-b: el microservicio real que recibe la orden de service-a
+# (en AWS) y la persiste en su DB local. Vive en GCP, y le exporta sus
+# propias trazas/métricas al Collector de GCP (su nube), no cruza a AWS
+# para eso — el cruce entre nubes ocurre a nivel de la llamada de negocio
+# (service-a en AWS → service-b en GCP por HTTPS), no en la telemetría.
+resource "google_cloud_run_v2_service" "service_b" {
+  depends_on = [google_project_service.run]
+  name       = "service-b"
+  location   = var.region
+  ingress    = "INGRESS_TRAFFIC_ALL" # service-a, en AWS, necesita alcanzarlo desde afuera
+
+  template {
+    containers {
+      image = var.service_b_image
+
+      ports {
+        name           = "http1"
+        container_port = 8001
+      }
+
+      env {
+        # Le exporta al Collector de GCP (su propia nube) — referenciado
+        # directo del recurso, no como variable, porque ambos viven en
+        # este mismo módulo de Terraform.
+        name  = "OTEL_EXPORTER_OTLP_ENDPOINT"
+        value = google_cloud_run_v2_service.otel_collector.uri
+      }
+
+      # /health sí vive en el mismo puerto que sirve tráfico real (8001),
+      # a diferencia del Collector — por eso aquí un http_get normal es
+      # confiable (no tuvimos el problema del puerto secundario).
+      startup_probe {
+        http_get {
+          path = "/health"
+          port = 8001
+        }
+        initial_delay_seconds = 5
+        timeout_seconds        = 3
+        period_seconds         = 5
+        failure_threshold      = 12
+      }
+
+      resources {
+        limits = {
+          cpu    = "1"
+          memory = "512Mi"
+        }
+      }
+    }
+  }
+}
+
+resource "google_cloud_run_v2_service_iam_member" "service_b_public_access" {
+  location = google_cloud_run_v2_service.service_b.location
+  name     = google_cloud_run_v2_service.service_b.name
+  role     = "roles/run.invoker"
+  member   = "allUsers"
+}
+
+output "service_b_url" {
+  description = "URL pública HTTPS de service-b. Esta es la que va en SERVICE_B_URL del lado de AWS (service-a) — actualiza esa variable y vuelve a aplicar terraform/aws para completar la conexión cross-cloud."
+  value       = google_cloud_run_v2_service.service_b.uri
 }
 
 output "artifact_registry_repo" {
