@@ -215,6 +215,26 @@ resource "aws_iam_role_policy_attachment" "otel_collector_xray" {
   policy_arn = "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
 }
 
+# --- Rol de tarea para Grafana: solo lectura de X-Ray, para el datasource
+# nativo de X-Ray (plugin aparte, se instala vía GF_INSTALL_PLUGINS en la
+# Task Definition de Grafana más abajo).
+resource "aws_iam_role" "grafana_task_role" {
+  name = "grafanaTaskRole"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "grafana_xray_read" {
+  role       = aws_iam_role.grafana_task_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSXrayReadOnlyAccess"
+}
+
 # ============================================================
 # Servicio 1: OTel Collector — recibe de los microservicios de AWS
 # (y del Collector de GCP no, ver terraform/gcp: GCP le exporta
@@ -494,9 +514,16 @@ resource "aws_ecs_task_definition" "grafana" {
   family                   = "grafana"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = "256"
-  memory                   = "512"
+  # Grafana 13.x es bastante más pesado que el resto de servicios (tiene su
+  # propio motor de búsqueda interno, un "apiserver" nuevo, etc.) — el mismo
+  # tamaño mínimo que usamos para todo lo demás lo dejaba sin recursos: la
+  # base de datos interna se bloqueaba (SQLITE_BUSY), sus propias peticiones
+  # hacían timeout, y probablemente ECS lo reiniciaba en bucle por no
+  # responder al healthcheck a tiempo.
+  cpu                      = "512"
+  memory                   = "1024"
   execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+  task_role_arn             = aws_iam_role.grafana_task_role.arn
 
   container_definitions = jsonencode([
     {
@@ -511,7 +538,10 @@ resource "aws_ecs_task_definition" "grafana" {
         # Es un lab con security group abierto a internet, no dejes esto así
         # en un entorno real.
         { name = "GF_SECURITY_ADMIN_USER", value = "admin" },
-        { name = "GF_SECURITY_ADMIN_PASSWORD", value = "admin" }
+        { name = "GF_SECURITY_ADMIN_PASSWORD", value = "admin" },
+        # X-Ray no viene incluido en Grafana de fábrica (a diferencia de
+        # CloudWatch/Prometheus/Jaeger) — hay que instalar su plugin aparte.
+        { name = "GF_INSTALL_PLUGINS", value = "grafana-x-ray-datasource" }
       ]
       logConfiguration = {
         logDriver = "awslogs"
