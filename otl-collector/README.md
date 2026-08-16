@@ -74,23 +74,15 @@ terraform init
 
 terraform apply \
   -var="collector_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/otel-collector:latest" \
-  -var="service_a_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/service-a:latest"
+  -var="service_a_image=<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/service-a:latest" \
+  -var="service_b_url=<SERVICE_B_URL_DE_GCP>"
 ```
+`service_b_url` tiene un default (`http://localhost:8001`, un placeholder) — puedes omitirlo en este primer `apply` si todavía no desplegaste `service-b` en GCP, y agregarlo después (ver "Completar la conexión cross-cloud" más abajo). Si ya lo tienes, pásalo desde ahora para no tener que repetir el `apply`.
 Esto crea: log groups, roles IAM (incluyendo permisos de X-Ray), cluster ECS, security group compartido, el namespace de Service Connect, y las 4 tareas — todas ya conectadas entre sí por DNS interno, listas desde el primer arranque.
 
-**Obtener las IPs públicas** (para acceder desde tu navegador/curl, o para GCP — Service Connect es solo interno a la VPC, esto sigue siendo necesario):
-```bash
-terraform output get_collector_public_ip_command
-terraform output get_jaeger_public_ip_command
-terraform output get_prometheus_public_ip_command
-terraform output get_service_a_public_ip_command
-terraform output get_grafana_public_ip_command
-```
+**Obtener las IPs públicas** (para acceder desde tu navegador/curl, o para GCP — Service Connect es solo interno a la VPC, esto sigue siendo necesario): usa la función `get_public_ip` de la sección **"Obtener todas las IPs/URLs de una vez"** más abajo — te da las 5 de una sola vez.
+
 Jaeger UI: `http://<IP_JAEGER>:16686` · Prometheus: `http://<IP_PROMETHEUS>:9090` · Grafana: `http://<IP_GRAFANA>:3000` (usuario/clave por defecto: `admin`/`admin`, cámbiala al entrar) · healthcheck del Collector: `http://<IP_COLLECTOR>:13133/`. Las trazas de AWS van a **X-Ray**, no a Jaeger.
-
-*(si haces cambios y vuelves a subir una imagen al mismo tag `latest`, Terraform no siempre detecta el cambio — fuerza el redeploy: `aws ecs update-service --cluster otel-lab-cluster --service <nombre-del-servicio> --force-new-deployment`)*
-
-> **Nota sobre Grafana**: en el datasource de Prometheus que configuraste desde la UI, puedes cambiar la URL de la IP pública a `http://prometheus.otel-lab.internal:9090` (nombre completo, **con** el sufijo del namespace) — así tampoco se rompe si Prometheus se recrea. Solo funciona porque Grafana también está registrado como cliente de Service Connect.
 
 ### 3. Probar manualmente con `curl`
 
@@ -118,17 +110,7 @@ curl -X POST http://<IP_COLLECTOR>:4318/v1/metrics \
   -H "Content-Type: application/json" \
   -d "{\"resourceMetrics\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"prueba-manual-aws\"}}]},\"scopeMetrics\":[{\"metrics\":[{\"name\":\"prueba_metrica_aws\",\"gauge\":{\"dataPoints\":[{\"asDouble\":42,\"timeUnixNano\":\"$NOW\"}]}}]}]}]}"
 ```
-Revisa en **Prometheus** (`http://<IP_PROMETHEUS>:9090`) — busca `prueba_metrica_aws`. Un solo `curl` da una línea recta; para una gráfica con variación real:
-```bash
-for i in $(seq 1 20); do
-  VALUE=$((RANDOM % 100))
-  NOW=$(date +%s%N)
-  curl -s -X POST http://<IP_COLLECTOR>:4318/v1/metrics \
-    -H "Content-Type: application/json" \
-    -d "{\"resourceMetrics\":[{\"resource\":{\"attributes\":[{\"key\":\"service.name\",\"value\":{\"stringValue\":\"prueba-manual-aws\"}}]},\"scopeMetrics\":[{\"metrics\":[{\"name\":\"prueba_metrica_aws\",\"gauge\":{\"dataPoints\":[{\"asDouble\":$VALUE,\"timeUnixNano\":\"$NOW\"}]}}]}]}]}" > /dev/null
-  sleep 5
-done
-```
+Revisa en **Prometheus** (`http://<IP_PROMETHEUS>:9090`) — busca `prueba_metrica_aws`.
 
 **service-a (el microservicio real)**:
 ```bash
@@ -145,6 +127,20 @@ aws ecs update-service --cluster otel-lab-cluster --service prometheus --desired
 aws ecs update-service --cluster otel-lab-cluster --service service-a --desired-count 0
 aws ecs update-service --cluster otel-lab-cluster --service grafana --desired-count 0
 # para reanudar cualquiera: --desired-count 1
+```
+
+**Si vuelves a subir una imagen al mismo tag `latest`**, Terraform no siempre detecta el cambio — fuerza el redeploy:
+```bash
+aws ecs update-service --cluster otel-lab-cluster --service <nombre-del-servicio> --force-new-deployment
+```
+
+**Si una tarea está atascada/mal comportándose** (ej. el bucle de `SQLITE_BUSY` de Grafana) sin que hayas cambiado ninguna imagen, un reinicio puntual es más rápido — detiene la tarea actual y ECS lanza una nueva automáticamente, misma imagen/config, sin pasar por `force-new-deployment`:
+```bash
+# 1. Sacar el ID de la tarea actual
+aws ecs list-tasks --cluster otel-lab-cluster --service-name <nombre-del-servicio> --query 'taskArns[0]' --output text
+
+# 2. Detenerla — ECS la reemplaza sola
+aws ecs stop-task --cluster otel-lab-cluster --task <TASK_ID>
 ```
 
 ### 4. Grafana — conectar el datasource de Prometheus
@@ -275,6 +271,21 @@ terraform apply \
 ```
 *(el timeout de `requests.post(...)` en `service-a` está en 5 segundos — para una llamada cross-cloud con TLS y posible cold start de Cloud Run, puede que veas timeouts ocasionales las primeras veces; si se vuelve un problema recurrente, es un ajuste de código a conversar con Astrid, no algo que arregles desde Terraform)*
 
+**Si vuelves a subir una imagen al mismo tag `latest`**, ni Terraform ni Cloud Run se enteran solos — fuerza una revisión nueva (aplica igual para el Collector que para `service-b`, son dos servicios de Cloud Run independientes):
+```bash
+gcloud run services update <nombre-del-servicio> --image=<IMAGEN_COMPLETA>:latest --region=us-central1
+
+# ej. otel-collector:
+gcloud run services update otel-collector --image=us-central1-docker.pkg.dev/<TU_PROJECT_ID>/observability/otel-collector:latest --region=us-central1
+
+# ej. service-b:
+gcloud run services update service-b --image=us-central1-docker.pkg.dev/<TU_PROJECT_ID>/observability/service-b:latest --region=us-central1
+```
+Confirma que tomó la imagen nueva:
+```bash
+gcloud run services describe <nombre-del-servicio> --region=us-central1 --format="value(status.latestReadyRevisionName)"
+```
+
 ### 3. Probar manualmente con `curl`
 
 Mismo patrón que en AWS, pero contra la URL de Cloud Run — sin puerto, con `--cacert` si tu red tiene inspección SSL corporativa (ver apéndice):
@@ -314,9 +325,32 @@ Ya no debería dar `502` — debería responder con la confirmación de `service
 
 ---
 
-## Obtener todas las IPs/URLs de una vez
+## ADRs (Decisiones de Arquitectura)
 
-### Resumen de servicios y puertos
+### ADR-001: Service Connect para las conexiones internas de AWS
+
+**Estado**: Aplicado
+
+**Contexto**: cada vez que el Collector o Prometheus se recreaban (cualquier `apply`, incluso uno que no debería tocarlos), Fargate les asignaba una IP pública nueva. `service-a` y Grafana, configurados con esa IP directa, quedaban "hablándole a la nada" sin ningún error visible — así se perdieron varias horas rastreando el problema durante esta actividad.
+
+**Alternativas consideradas**:
+- Seguir con IP pública directa + actualizar manualmente cada vez que cambia (lo que se venía haciendo — no escala, propenso a error humano).
+- Un ALB compartido con DNS fijo (resuelve también el acceso externo/humano, pero tiene costo fijo recurrente incluso en horas sin uso — se descartó por ahora, queda en el radar si el dolor vuelve a aparecer).
+- **AWS Service Connect** (namespace de Cloud Map): DNS interno gratuito, sin infraestructura adicional que mantener.
+
+**Decisión**: usar Service Connect (namespace `otel-lab.internal`) para las conexiones internas a AWS:
+- `http://otel-collector.otel-lab.internal:4318` — `service-a` le exporta ahí, ya no a una IP.
+- `http://prometheus.otel-lab.internal:9090` — el Collector (y opcionalmente Grafana, si actualizas el datasource) le hacen `remote_write`/consultan ahí.
+
+> **Detalle de implementación importante**: hay que usar el nombre completo, **con** el sufijo del namespace — confirmado revisando `/etc/hosts` real dentro de un contenedor (`aws ecs execute-command`, ver apéndice). Las entradas que ECS inyecta son `otel-collector.otel-lab.internal` y `prometheus.otel-lab.internal`, completas. Un intento de usar el nombre corto (`otel-collector`, sin sufijo) dio `NameResolutionError` — esa entrada nunca existió.
+
+**Consecuencias**:
+- Estos nombres **siempre** resuelven a la tarea actual, sin importar cuántas veces se recree — el `apply` de AWS ya no necesita el segundo paso con IPs reales que tenía antes.
+- **Lo que NO resuelve** (alcance limitado a propósito): el acceso desde tu navegador a las UIs (Jaeger, Prometheus, Grafana) sigue siendo por IP pública, porque Service Connect es solo *interno* a la VPC. La conexión cross-cloud GCP → Jaeger/Prometheus tampoco — GCP está fuera de la VPC de AWS, sigue necesitando las IPs públicas (ver la siguiente sección).
+
+---
+
+## Resumen de servicios y URLs
 
 | Nube | Servicio | Puerto | Para qué |
 |---|---|---|---|
@@ -329,7 +363,7 @@ Ya no debería dar `502` — debería responder con la confirmación de `service
 | GCP | Collector | `<TU_PROJECT_ID>...run.app` (HTTPS, sin puerto) | OTLP HTTP — trazas/métricas de service-b |
 | GCP | service-b | `<TU_PROJECT_ID>...run.app` (HTTPS, sin puerto) | `/health`, `POST /process` |
 
-Las URLs de Cloud Run (GCP) son fijas mientras no borres el servicio — sácalas una vez con `terraform output -raw collector_url` / `service_b_url` y quedan. Las IPs de AWS **sí** cambian en cada redeploy de esa tarea (ver "Service Connect" más abajo para las conexiones internas, que ya no dependen de esto).
+Las URLs de Cloud Run (GCP) son fijas mientras no borres el servicio — sácalas una vez con `terraform output -raw collector_url` / `service_b_url` y quedan. Las IPs de AWS **sí** cambian en cada redeploy de esa tarea (ver ADR-001 más arriba para las conexiones internas, que ya no dependen de esto).
 
 Como las IPs de AWS cambian cada vez que Fargate recrea una tarea (cualquier `apply`, incluso uno que no debería tocar cierto servicio), antes de cualquier prueba conviene confirmar rápido que no cambió nada desde la última vez:
 
@@ -356,22 +390,9 @@ cd ../gcp
 echo "Collector: $(terraform output -raw collector_url)"
 echo "service-b: $(terraform output -raw service_b_url)"
 ```
-Con Service Connect (ver más abajo), `service-a` ya no depende de la IP pública del Collector para las conexiones **internas** — así que este chequeo ya no es crítico para eso. Sigue siendo útil por dos razones: (1) para acceder tú desde el navegador a Jaeger/Prometheus/Grafana, y (2) porque GCP **sí** sigue necesitando las IPs públicas de Jaeger y Prometheus (Service Connect es solo interno a la VPC de AWS, GCP queda fuera de su alcance) — si esas cambian, hay que volver a aplicar `terraform/gcp` con las IPs nuevas.
+Con Service Connect (ADR-001), `service-a` ya no depende de la IP pública del Collector para las conexiones **internas** — así que este chequeo ya no es crítico para eso. Sigue siendo útil por dos razones: (1) para acceder tú desde el navegador a Jaeger/Prometheus/Grafana, y (2) porque GCP **sí** sigue necesitando las IPs públicas de Jaeger y Prometheus (Service Connect es solo interno a la VPC de AWS, GCP queda fuera de su alcance) — si esas cambian, hay que volver a aplicar `terraform/gcp` con las IPs nuevas.
 
-## Service Connect — DNS interno para las conexiones dentro de AWS
-
-Antes, cada vez que el Collector o Prometheus se recreaban (cualquier `apply`, incluso uno que no debería tocarlos), su IP cambiaba y `service-a`/Grafana quedaban "hablándole a la nada" sin ningún error visible — así perdimos varias horas hoy rastreando el problema. La solución: un namespace de **Cloud Map** (`otel-lab.internal`) donde cada servicio se registra con un nombre fijo:
-
-- `http://otel-collector.otel-lab.internal:4318` — `service-a` le exporta ahí, ya no a una IP.
-- `http://prometheus.otel-lab.internal:9090` — el Collector (y opcionalmente Grafana, si actualizas el datasource) le hacen `remote_write`/consultan ahí.
-
-> **Usa el nombre completo, CON el sufijo del namespace** — confirmado revisando `/etc/hosts` real dentro de un contenedor (`aws ecs execute-command`, ver apéndice): las entradas que ECS inyecta son `otel-collector.otel-lab.internal` y `prometheus.otel-lab.internal`, completas. Un intento anterior de usar el nombre corto (`otel-collector`, sin sufijo) dio `NameResolutionError` — esa entrada nunca existió.
-
-Estos nombres **siempre** resuelven a la tarea actual, sin importar cuántas veces se recree — por eso el `apply` de la sección de AWS ya no necesita el segundo paso con IPs reales que tenía antes.
-
-**Lo que Service Connect NO resuelve** (para que no asumas que ya no necesitas nada de lo de arriba):
-- El acceso desde tu navegador a las UIs (Jaeger, Prometheus, Grafana) — sigue siendo por IP pública, Service Connect es solo *interno* a la VPC.
-- La conexión cross-cloud GCP → Jaeger/Prometheus — GCP está fuera de la VPC de AWS, sigue necesitando las IPs públicas (por eso el chequeo de arriba sigue siendo relevante para ese caso puntual).
+---
 
 ## Cómo consultar cada backend
 
@@ -409,11 +430,29 @@ Si no sabes qué buscar, empieza solo con `service("service-a")`, ordena por má
 
 UI: `http://<JAEGER_IP>:16686`. Cambia el desplegable **"Service"** al nombre del servicio que buscas (`service-b`, `prueba-manual-gcp`, etc. — no lo dejes en `jaeger-all-in-one`, que es Jaeger monitoreándose a sí mismo). Ajusta **"Lookback"** si tu prueba fue hace más de una hora. Dale **"Find Traces"**.
 
-### Grafana — todo desde un solo lugar
+### Grafana — conectar los 4 datasources
 
-Una vez conectados los datasources (Prometheus, CloudWatch, Jaeger — ver pasos más abajo si te falta alguno), puedes usar **Explore** (menú lateral) para consultar cualquiera de los tres sin salir de Grafana, cambiando el datasource arriba a la izquierda.
+Prometheus, CloudWatch y Jaeger vienen **incluidos** en Grafana de fábrica. **X-Ray no** — necesita un plugin aparte, que ya viene instalado automáticamente (variable `GF_INSTALL_PLUGINS` en la Task Definition) y con permisos IAM de solo lectura (`grafana_task_role`) para poder consultarlo.
 
-**Conectar CloudWatch** (para ver logs, ej. errores del Collector): Connections → Data sources → Add new → CloudWatch → región `us-east-1` → autenticación con el rol de la tarea (o tus credenciales, según cómo lo hayas configurado). En Explore, modo **"CloudWatch Logs"** (no "CloudWatch Metrics"), grupo `/ecs/otel-observability`:
+**1. Prometheus** (el primero que sueles necesitar, para los paneles de métricas):
+1. `http://<IP_GRAFANA>:3000` → usuario `admin`, clave `admin` (te pide cambiarla al primer login).
+2. Menú ☰ → **Connections** → **Data sources** → **Add data source** → **Prometheus**.
+3. **Prometheus server URL**: `http://prometheus.otel-lab.internal:9090` (nombre completo de Service Connect — no la IP pública, para que no se rompa si Prometheus se recrea).
+4. **Save & test**.
+
+Ejemplos de query en **Explore** (datasource Prometheus):
+```
+{job="service-a"}                                                       # todas las métricas de un servicio
+up{cloud_provider="aws"}                                                # correlación cross-cloud (o cloud_provider="gcp")
+histogram_quantile(0.95, http_client_duration_milliseconds_bucket{job="service-a"})  # p95 de latencia
+```
+
+**2. CloudWatch** (para logs, ej. errores del Collector):
+1. Add data source → **CloudWatch**.
+2. Región `us-east-1` → autenticación con el rol de la tarea (o tus credenciales, según cómo lo hayas configurado).
+3. **Save & test**.
+
+Ejemplo de query en Explore, modo **"CloudWatch Logs"** (no "CloudWatch Metrics"), grupo `/ecs/otel-observability`:
 ```
 fields @timestamp, @message
 | filter @logStream like /otel-collector/
@@ -421,14 +460,33 @@ fields @timestamp, @message
 | sort @timestamp desc
 | limit 100
 ```
+Cambia `/otel-collector/` por `/service-a/`, `/grafana/`, etc. según qué servicio quieras revisar.
 
-**Conectar Jaeger**: Connections → Data sources → Add new → busca "Jaeger" → URL: `http://<JAEGER_IP>:16686` (mismo puerto que la UI) → Save & test.
+**3. Jaeger** (trazas de GCP):
+1. Add data source → **Jaeger**.
+2. **URL**: `http://<JAEGER_IP>:16686` (mismo puerto que la UI directa — Jaeger no está en Service Connect, sigue siendo IP pública).
+3. **Save & test**.
+
+En Explore (datasource Jaeger): el campo **"Service"** reemplaza al desplegable que usas en la UI directa de Jaeger — selecciona `service-b` (o el servicio que busques, nunca `jaeger-all-in-one`, que es Jaeger monitoreándose a sí mismo) y **"Find Traces"**.
+
+**4. X-Ray** (trazas de AWS — el único que necesita el plugin, ya instalado):
+1. Add data source → busca **"X-Ray"** (aparece como "AWS X-Ray"). Si no aparece en la lista, el plugin no terminó de instalarse — revisa los logs de arranque de Grafana en Logs Insights, filtrando `@logStream like /grafana/` y buscando `plugin`/`install`/`x-ray` (ver apéndice si el plugin nunca se instaló).
+2. **Default Region**: `us-east-1`.
+3. **Auth Provider**: `AWS SDK Default` (usa el rol de la tarea automáticamente, sin necesitar Access Key/Secret a mano).
+4. **Save & test**.
+
+En Explore (datasource X-Ray), tipo de query **"Trace List"**, filtro:
+```
+service("service-a") AND url("/order")   # servicio + ruta específica
+service("service-a") AND error            # solo las que fallaron
+```
+(misma sintaxis que en la consola directa de X-Ray — ver la sección "Cómo consultar cada backend" más abajo para más ejemplos)
 
 ## Validar el pipeline completo (resumen)
-- Trazas de AWS → consola de **X-Ray** (`us-east-1`).
-- Trazas de GCP → **Jaeger UI** (`http://<IP_JAEGER>:16686`), filtrando por servicio.
+- Trazas de AWS → consola de **X-Ray** (`us-east-1`) o desde Grafana con el datasource de X-Ray.
+- Trazas de GCP → **Jaeger UI** (`http://<IP_JAEGER>:16686`), filtrando por servicio, o desde Grafana con el datasource de Jaeger.
 - Métricas de ambas nubes → **Prometheus** (`http://<IP_PROMETHEUS>:9090`), un solo backend compartido.
-- Dashboards → **Grafana** (`http://<IP_GRAFANA>:3000`), conectado a Prometheus como datasource.
+- Dashboards → **Grafana** (`http://<IP_GRAFANA>:3000`), con los 4 datasources conectados (Prometheus, CloudWatch, Jaeger, X-Ray).
 - Logs de AWS → **CloudWatch**. Logs de GCP → **Cloud Logging**.
 - Healthcheck del Collector de AWS: `GET http://<IP_COLLECTOR>:13133/`. El de GCP no es accesible públicamente — revisa el estado del servicio en la consola de Cloud Run.
 - **La prueba de fondo**: `POST /order` en service-a (AWS) → llega a service-b (GCP) → un solo `trace_id` partido entre X-Ray (mitad AWS) y Jaeger (mitad GCP). Es la propagación de contexto cross-cloud que pide la actividad.
@@ -438,7 +496,7 @@ fields @timestamp, @message
 - [ ] Captura de la consola de AWS X-Ray con trazas de los microservicios de AWS.
 - [ ] Captura de Jaeger UI con trazas de los microservicios de GCP.
 - [ ] Captura de Prometheus mostrando métricas etiquetadas `cloud.provider=aws` y `cloud.provider=gcp`.
-- [ ] Captura de Grafana con el datasource de Prometheus conectado (y los paneles, una vez Alex los arme en la Fase 3).
+- [ ] Captura de Grafana con los 4 datasources conectados (y los paneles, una vez Alex los arme en la Fase 3).
 - [ ] Captura del `POST /order` exitoso (service-a → service-b) con el mismo `trace_id` visible en ambos backends — la evidencia más fuerte de correlación cross-cloud.
 - [ ] Explicación breve de por qué las trazas se dividen así (Jaeger para GCP, X-Ray para AWS, según la actividad) mientras las métricas quedan centralizadas en un solo Prometheus.
 - [ ] Diagrama actualizado del pipeline (5 servicios en AWS + Cloud Run x2 en GCP).
@@ -457,27 +515,39 @@ cd ../gcp && terraform destroy
 ### Error SSL: `certificate verify failed` (aws-cli)
 Proxy corporativo con inspección SSL. 1) Exporta el certificado raíz del proxy desde el navegador (candado → ver certificado → Exportar → Base-64 X.509). 2) Descarga https://curl.se/ca/cacert.pem, pega el certificado del proxy al final, guarda como `aws-ca-bundle.pem`. 3) `export AWS_CA_BUNDLE="/c/Users/<tu_usuario>/aws-ca-bundle.pem"` (agrégalo a `~/.bashrc`).
 
+---
+
 ### `terraform apply` en GCP falla con `Image '...' not found`
 Cloud Run intentó descargar una imagen que nunca se subió (o el `push` falló sin que te dieras cuenta). Verifica qué hay realmente en el repo antes de reintentar:
 ```bash
 gcloud artifacts docker images list us-central1-docker.pkg.dev/<TU_PROJECT_ID>/observability
 ```
-Si falta la imagen, corre de nuevo el build/tag/push de la Fase de Imágenes correspondiente (AWS o GCP) antes de repetir el `apply`.
+Si falta la imagen, corre de nuevo el build/tag/push de la sección "1. Imágenes" correspondiente (AWS o GCP) antes de repetir el `apply`.
+
+---
 
 ### `terraform apply` en GCP falla con un timeout de conexión a `oauth2.googleapis.com` (`connectex`/`dial tcp`)
 No es un error de certificado (esos ya los resolvimos aparte) — es un timeout de conexión TCP puntual, normalmente un bache momentáneo de red. Reintenta el mismo `apply` tal cual; si persiste, confirma conectividad general con `curl -I --cacert "<ruta_al_bundle>" https://oauth2.googleapis.com` antes de investigar más a fondo (VPN, proxy explícito, etc.).
 
+---
+
 ### `Invalid id: "eni-...\n"` al encadenar los comandos de `get_..._public_ip_command`
-En Windows/Git Bash, encadenar varios comandos con `$()`/`eval` en una sola línea (como salen los outputs `get_..._public_ip_command`) puede dejar un `\r` pegado al final de un valor intermedio, que arruina el siguiente comando de la cadena. Ver la sección "Obtener todas las IPs/URLs de una vez" — la función `get_public_ip` con `tr -d '\r'` en cada paso lo evita.
+En Windows/Git Bash, encadenar varios comandos con `$()`/`eval` en una sola línea (como salen los outputs `get_..._public_ip_command`) puede dejar un `\r` pegado al final de un valor intermedio, que arruina el siguiente comando de la cadena. Ver la sección "Resumen de servicios y URLs" — la función `get_public_ip` con `tr -d '\r'` en cada paso lo evita.
+
+---
 
 ### `terraform apply` te pregunta por una variable que no reconoces (ej. `aws_jaeger_public_ip` estando en `terraform/aws`)
 Estás en la carpeta equivocada — esa variable es de `terraform/gcp`. Confirma con `pwd` antes de correr cualquier `apply`, y ojo con las variables tipo `*_public_ip`: van **solo la IP** (`54.172.71.134`), nunca con `http://` ni `/` — el `.tf` arma la URL completa por dentro.
+
+---
 
 ### `gcloud` + certificado corporativo: `certificate verify failed`
 Mismo proxy, `gcloud` no usa `AWS_CA_BUNDLE` — usa su propia config, reutilizando el mismo archivo:
 ```bash
 gcloud config set core/custom_ca_certs_file "/c/Users/<tu_usuario>/aws-ca-bundle.pem"
 ```
+
+---
 
 ### `curl` directo a HTTPS también falla con el mismo error SSL
 Solo pasa contra HTTPS (por eso no lo viste probando contra AWS, que expone HTTP plano) — sí te pasa contra Cloud Run.
@@ -486,49 +556,79 @@ export CURL_CA_BUNDLE="/c/Users/<tu_usuario>/aws-ca-bundle.pem"
 ```
 O puntual: `curl --cacert "/c/Users/<tu_usuario>/aws-ca-bundle.pem" ...`
 
+---
+
 ### `docker push` a ECR falla con `denied: Your authorization token has expired`
 El login de Docker a ECR expira cada ~12h. Repite: `aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com`
+
+---
 
 ### `service-a` no arranca con `ModuleNotFoundError: No module named 'pkg_resources'`
 `opentelemetry-instrumentation` (base de `-fastapi` y `-requests`) importa `pkg_resources`, que viene de `setuptools` — no de Python. `pip` moderno y `python:3.12-slim` no lo instalan solo. Solución: agregar `setuptools` explícito al `requirements.txt`.
 
+---
+
 ### `service-b` no arranca por un `ImportError`/`ModuleNotFoundError` con `SQLite3Instrumentor`
 El código importa `from opentelemetry.instrumentation.sqlite3 import SQLite3Instrumentor`, pero ese paquete (`opentelemetry-instrumentation-sqlite3`) no viene incluido solo por tener `opentelemetry-instrumentation-fastapi`/`-requests` — hay que listarlo aparte en `requirements.txt`, igual que cualquier otro instrumentador específico (DB, mensajería, etc.) que uses más adelante.
+
+---
 
 ### Error `InvalidClientTokenId`
 El perfil `default` de AWS CLI tiene una Access Key inválida. Usa el perfil con nombre que sí funciona: `export AWS_PROFILE=<tu-perfil-bueno>`
 
+---
+
 ### El repositorio de ECR/Artifact Registry se crea fuera de Terraform, a propósito
 Evita el problema de "quién lo crea primero". Terraform solo lo referencia (`data` source), nunca lo crea ni lo destruye.
+
+---
 
 ### El Collector crashea con `cannot resolve the configuration: retrieved value (type=string) cannot be used as a Conf`
 Causa: una variable `${env:VAR}` como elemento suelto dentro de una lista YAML, en vez de valor completo de un campo. Solución: dos archivos de config completos (uno por nube), seleccionados por `command`/`args` desde Terraform.
 
 Para diagnosticar sin gastar en despliegues: reprodúcelo en local con `docker run`. Si el log sale cortado, usa `docker run -d --name debug ... && docker logs debug` en vez de `--rm`.
 
+---
+
 ### El Collector no arranca con `invalid configuration: exporters::<algo>: '<campo>' must be set`
 El Collector valida **todos** los exporters declarados, incluso los no usados en ningún pipeline. Solución: cada config solo declara los exporters que esa nube realmente usa.
+
+---
 
 ### `service-a` responde `502 service-b no disponible` de forma intermitente
 Causa probable: cold start de Cloud Run. Si `service-b` estuvo sin tráfico un rato, Cloud Run puede escalarlo a 0 instancias — la siguiente petición tiene que esperar a que el contenedor arranque de cero (varios segundos), y el timeout de `service-a` (`requests.post(..., timeout=5)`) es más corto que eso. Solución: fijar `service-b` en 1 instancia siempre activa (`scaling { min_instance_count = 1 }`), mismo criterio que ya usamos para el Collector.
 
+---
+
 ### Las peticiones a Cloud Run responden con HTTP 415
 Cloud Run solo expone un puerto. `4317`/`h2c` es gRPC; nuestros `curl` mandan JSON por HTTP/1.1, que necesita `4318`. Solución: exponer `4318` en `terraform/gcp/main.tf`.
+
+---
 
 ### `gcloud projects create` falla con "exceeded your allotted project quota"
 Ya cubierto en GCP → Paso 0 — usa el proyecto por defecto.
 
+---
+
 ### `terraform apply` en GCP falla con "could not find default credentials"
 Ya cubierto en GCP → Paso 0 — usa la cuenta de servicio.
+
+---
 
 ### Una traza de prueba llega al Collector (`partialSuccess`) pero no aparece en X-Ray
 El formato del `traceId` — ver AWS → Paso 3.
 
+---
+
 ### El tag `latest` no dispara redeploy automático en ECS
-Fuerza el redeploy manualmente con `--force-new-deployment` (ver AWS → Paso 2).
+Fuerza el redeploy manualmente con `--force-new-deployment` (ver AWS → Paso 3).
+
+---
 
 ### `service-a` (o Grafana) pierde la conexión al Collector/Prometheus sin ningún error visible
-Antes de tener Service Connect: cada redeploy del Collector o Prometheus les daba una IP nueva, y quien les hablaba (`service-a`, Grafana) seguía apuntando a la vieja — sin ningún error, los datos simplemente se perdían en el camino. Ya resuelto para las conexiones internas a AWS con el namespace `otel-lab.internal` — sigue aplicando solo para el tramo cross-cloud hacia GCP, que no puede usar Service Connect (está fuera de la VPC).
+Ver **ADR-001** — es justo el problema que Service Connect resuelve. Si lo sigues viendo después de aplicar esa decisión, confirma que la tarea actual realmente tenga la config nueva (compara su Task Definition activa contra la más reciente registrada).
+
+---
 
 ### `service-a` no exporta con `NameResolutionError: Failed to resolve '<algo>'`
 Diagnóstico: revisa primero los logs del propio `service-a` (no del Collector) en Logs Insights, filtrando `@logStream like /service-a/` — el SDK de OTel en Python sí loguea el error de conexión. Si eso no basta para confirmar la causa, la prueba definitiva es entrar al contenedor y mirar `/etc/hosts` de verdad:
@@ -541,9 +641,24 @@ cat /etc/hosts
 ```
 Esto requiere `enable_execute_command = true` en el servicio y un rol de tarea con permisos `ssmmessages:*` (ver `service_a_task_role` en `terraform/aws/main.tf`) — sin eso, `execute-command` falla con error de permisos.
 
-Causa confirmada en este repo: **Service Connect SÍ registra el nombre completo con el sufijo del namespace** (`otel-collector.otel-lab.internal`), no el nombre corto — confirmado viendo `/etc/hosts` real (`127.255.0.1 otel-collector.otel-lab.internal`). Un intento de usar el nombre corto (`otel-collector`, sin sufijo) fue un paso en falso basado en un ejemplo de otra configuración que no aplicaba aquí — quedó revertido a `http://otel-collector.otel-lab.internal:4318` en `terraform/aws/main.tf`.
+Causa confirmada: ver **ADR-001** — el detalle de implementación (nombre completo vs. corto) que este diagnóstico ayudó a descubrir.
 
-*(Nota sobre `execute-command` en Windows/Git Bash: si te da `SessionManagerPlugin is not found`, instálalo desde `https://s3.amazonaws.com/session-manager-downloads/plugin/latest/windows/SessionManagerPluginSetup.exe` y agrega su carpeta al PATH. Si después el error es `Failed to start pty: fork/exec .../usr/bin/sh: no such file or directory`, es Git Bash "traduciendo" `/bin/sh` a una ruta de Windows — antepón `MSYS_NO_PATHCONV=1` al comando, como en el ejemplo de arriba.)*
+---
+
+### `aws ecs execute-command` falla con `SessionManagerPlugin is not found` o `Failed to start pty: fork/exec .../usr/bin/sh: no such file or directory`
+Dos problemas distintos de Windows/Git Bash, no de AWS en sí. Primero, instala el plugin (falta por defecto): `https://s3.amazonaws.com/session-manager-downloads/plugin/latest/windows/SessionManagerPluginSetup.exe`, y agrega su carpeta al PATH. Segundo, si después de eso el error cambia a `Failed to start pty: fork/exec .../usr/bin/sh`, es Git Bash "traduciendo" automáticamente `/bin/sh` a una ruta de Windows que no existe — antepón `MSYS_NO_PATHCONV=1` al comando completo (ver el ejemplo de `execute-command` en la entrada anterior).
+
+---
+
+### Grafana se reinicia solo / errores internos (`SQLITE_BUSY`, `context deadline exceeded`, `http: Handler timeout`)
+Causa confirmada: Grafana 13.x es bastante más pesado que el resto de servicios de este repo (Jaeger, Prometheus, etc.) — el tamaño mínimo que usamos para todo lo demás (`0.25 vCPU / 0.5 GB`) lo dejaba sin recursos, su base de datos interna (SQLite) se bloqueaba, sus propias peticiones internas hacían timeout, y probablemente ECS lo mataba y reiniciaba en bucle por no responder al healthcheck a tiempo. Esto también explica por qué el plugin de X-Ray nunca lograba instalarse (sin recursos ni tiempo para completar esa descarga extra). Solución: subir a `cpu = "512"` / `memory = "1024"` en la Task Definition de Grafana, como ya quedó en `terraform/aws/main.tf`.
+
+---
+
+### El datasource de X-Ray no aparece en la lista de Grafana
+Revisa primero la entrada de arriba (falta de recursos) — es la causa más probable. Si Grafana ya tiene recursos suficientes y aun así no aparece, revisa en Logs Insights, grupo `/ecs/otel-observability`, filtro `@logStream like /grafana/`, buscando líneas con `plugin`/`install`/`x-ray` — confirma si el intento de instalación aparece y si tuvo éxito. Si nunca lo intentó, confirma que la Task Definition de Grafana en uso ya tenga la variable `GF_INSTALL_PLUGINS=grafana-x-ray-datasource` (compara la revisión activa contra la más reciente, mismo patrón de verificación que usamos para `service-a` con Service Connect).
+
+---
 
 ### El Collector crashea con `listen tcp 0.0.0.0:4317: bind: address already in use`
 Pasaba cuando Jaeger compartía tarea con el Collector (ya no aplica — cada uno tiene su propia tarea/ENI). Se deja documentado por si vuelves a compartir tareas por costo.
