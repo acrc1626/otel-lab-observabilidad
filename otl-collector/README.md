@@ -66,7 +66,7 @@ Al terminar esta sección: dos imágenes en ECR (`otel-collector` y `service-a`)
 
 ### 2. Desplegar con Terraform
 
-Son **4 servicios independientes** (Collector, Jaeger, Prometheus, service-a — ninguno comparte tarea), cada uno con su propio ENI/IP pública. Las conexiones **internas** (service-a → Collector, Collector → Prometheus) van por **Service Connect** (DNS privado de Cloud Map: `otel-collector.otel-lab.internal`, `prometheus.otel-lab.internal`) — ya no dependen de ninguna IP pública que cambie en cada redeploy, así que un solo `apply` es suficiente, sin el "baile" de dos pasos que tenías antes:
+Son **4 servicios independientes** (Collector, Jaeger, Prometheus, service-a — ninguno comparte tarea), cada uno con su propio ENI/IP pública. Las conexiones **internas** (service-a → Collector, Collector → Prometheus) van por **Service Connect** (nombres cortos vía `/etc/hosts` inyectado por ECS: `otel-collector`, `prometheus` — **no** DNS real, y **no** llevan el sufijo del namespace) — ya no dependen de ninguna IP pública que cambie en cada redeploy, así que un solo `apply` es suficiente, sin el "baile" de dos pasos que tenías antes:
 
 ```bash
 cd terraform/aws
@@ -90,7 +90,7 @@ Jaeger UI: `http://<IP_JAEGER>:16686` · Prometheus: `http://<IP_PROMETHEUS>:909
 
 *(si haces cambios y vuelves a subir una imagen al mismo tag `latest`, Terraform no siempre detecta el cambio — fuerza el redeploy: `aws ecs update-service --cluster otel-lab-cluster --service <nombre-del-servicio> --force-new-deployment`)*
 
-> **Nota sobre Grafana**: en el datasource de Prometheus que configuraste desde la UI, puedes cambiar la URL de la IP pública a `http://prometheus.otel-lab.internal:9090` — así tampoco se rompe si Prometheus se recrea. Solo funciona porque Grafana también está registrado como cliente de Service Connect.
+> **Nota sobre Grafana**: en el datasource de Prometheus que configuraste desde la UI, puedes cambiar la URL de la IP pública a `http://prometheus.otel-lab.internal:9090` (nombre completo, **con** el sufijo del namespace) — así tampoco se rompe si Prometheus se recrea. Solo funciona porque Grafana también está registrado como cliente de Service Connect.
 
 ### 3. Probar manualmente con `curl`
 
@@ -316,6 +316,21 @@ Ya no debería dar `502` — debería responder con la confirmación de `service
 
 ## Obtener todas las IPs/URLs de una vez
 
+### Resumen de servicios y puertos
+
+| Nube | Servicio | Puerto | Para qué |
+|---|---|---|---|
+| AWS | Collector | `<COLLECTOR_IP>:4318` | OTLP HTTP — trazas/métricas de service-a |
+| AWS | Collector | `<COLLECTOR_IP>:13133` | Healthcheck |
+| AWS | Jaeger | `<JAEGER_IP>:16686` | UI de trazas (recibe de GCP) |
+| AWS | Prometheus | `<PROMETHEUS_IP>:9090` | UI + remote-write (métricas de ambas nubes) |
+| AWS | service-a | `<SERVICE_A_IP>:8000` | `/health`, `POST /order` |
+| AWS | Grafana | `<GRAFANA_IP>:3000` | Dashboards (`admin`/`admin` por defecto) |
+| GCP | Collector | `<TU_PROJECT_ID>...run.app` (HTTPS, sin puerto) | OTLP HTTP — trazas/métricas de service-b |
+| GCP | service-b | `<TU_PROJECT_ID>...run.app` (HTTPS, sin puerto) | `/health`, `POST /process` |
+
+Las URLs de Cloud Run (GCP) son fijas mientras no borres el servicio — sácalas una vez con `terraform output -raw collector_url` / `service_b_url` y quedan. Las IPs de AWS **sí** cambian en cada redeploy de esa tarea (ver "Service Connect" más abajo para las conexiones internas, que ya no dependen de esto).
+
 Como las IPs de AWS cambian cada vez que Fargate recrea una tarea (cualquier `apply`, incluso uno que no debería tocar cierto servicio), antes de cualquier prueba conviene confirmar rápido que no cambió nada desde la última vez:
 
 ```bash
@@ -347,14 +362,67 @@ Con Service Connect (ver más abajo), `service-a` ya no depende de la IP públic
 
 Antes, cada vez que el Collector o Prometheus se recreaban (cualquier `apply`, incluso uno que no debería tocarlos), su IP cambiaba y `service-a`/Grafana quedaban "hablándole a la nada" sin ningún error visible — así perdimos varias horas hoy rastreando el problema. La solución: un namespace de **Cloud Map** (`otel-lab.internal`) donde cada servicio se registra con un nombre fijo:
 
-- `otel-collector.otel-lab.internal:4318` — `service-a` le exporta ahí, ya no a una IP.
-- `prometheus.otel-lab.internal:9090` — el Collector (y opcionalmente Grafana, si actualizas el datasource) le hacen `remote_write`/consultan ahí.
+- `http://otel-collector.otel-lab.internal:4318` — `service-a` le exporta ahí, ya no a una IP.
+- `http://prometheus.otel-lab.internal:9090` — el Collector (y opcionalmente Grafana, si actualizas el datasource) le hacen `remote_write`/consultan ahí.
+
+> **Usa el nombre completo, CON el sufijo del namespace** — confirmado revisando `/etc/hosts` real dentro de un contenedor (`aws ecs execute-command`, ver apéndice): las entradas que ECS inyecta son `otel-collector.otel-lab.internal` y `prometheus.otel-lab.internal`, completas. Un intento anterior de usar el nombre corto (`otel-collector`, sin sufijo) dio `NameResolutionError` — esa entrada nunca existió.
 
 Estos nombres **siempre** resuelven a la tarea actual, sin importar cuántas veces se recree — por eso el `apply` de la sección de AWS ya no necesita el segundo paso con IPs reales que tenía antes.
 
 **Lo que Service Connect NO resuelve** (para que no asumas que ya no necesitas nada de lo de arriba):
 - El acceso desde tu navegador a las UIs (Jaeger, Prometheus, Grafana) — sigue siendo por IP pública, Service Connect es solo *interno* a la VPC.
 - La conexión cross-cloud GCP → Jaeger/Prometheus — GCP está fuera de la VPC de AWS, sigue necesitando las IPs públicas (por eso el chequeo de arriba sigue siendo relevante para ese caso puntual).
+
+## Cómo consultar cada backend
+
+### Prometheus (métricas) — lenguaje PromQL
+
+UI: `http://<PROMETHEUS_IP>:9090`. Si no sabes el nombre exacto de una métrica, filtra por servicio con solo la etiqueta:
+```
+{job="service-a"}
+{job="otel-collector"}
+```
+Consultas útiles:
+```
+up{job="service-a"}                                                    # ¿está vivo?
+up{cloud_provider="aws"}                                                # correlación cross-cloud (o cloud_provider="gcp")
+http_client_duration_milliseconds_count{job="service-a"}                # total de peticiones
+histogram_quantile(0.95, http_client_duration_milliseconds_bucket{job="service-a"})  # p95 de latencia
+```
+El selector de rango de tiempo (arriba) ajusta el eje de la gráfica solo — no tiene el mismo problema de "ventana muy corta" que X-Ray.
+
+### AWS X-Ray (trazas de AWS)
+
+Consola: `https://us-east-1.console.aws.amazon.com/cloudwatch/home?region=us-east-1#xray:traces/query`. **Ojo con el filtro de tiempo** — cámbialo a "3h" o "Custom", el default de "Last 5 minutes" es fácil que se te pase.
+
+Sintaxis de filtro:
+```
+service("service-a")                              # todo de un servicio
+service("service-a") AND url("/order")             # servicio + ruta específica
+service("service-a") AND error                     # solo las que fallaron
+responsetime > 5                                    # más lentas de 5s (útil para encontrar cold starts)
+service("service-a") AND method("POST") AND error  # combinando filtros
+```
+Si no sabes qué buscar, empieza solo con `service("service-a")`, ordena por más reciente, y ubica tu prueba por el timestamp.
+
+### Jaeger (trazas de GCP)
+
+UI: `http://<JAEGER_IP>:16686`. Cambia el desplegable **"Service"** al nombre del servicio que buscas (`service-b`, `prueba-manual-gcp`, etc. — no lo dejes en `jaeger-all-in-one`, que es Jaeger monitoreándose a sí mismo). Ajusta **"Lookback"** si tu prueba fue hace más de una hora. Dale **"Find Traces"**.
+
+### Grafana — todo desde un solo lugar
+
+Una vez conectados los datasources (Prometheus, CloudWatch, Jaeger — ver pasos más abajo si te falta alguno), puedes usar **Explore** (menú lateral) para consultar cualquiera de los tres sin salir de Grafana, cambiando el datasource arriba a la izquierda.
+
+**Conectar CloudWatch** (para ver logs, ej. errores del Collector): Connections → Data sources → Add new → CloudWatch → región `us-east-1` → autenticación con el rol de la tarea (o tus credenciales, según cómo lo hayas configurado). En Explore, modo **"CloudWatch Logs"** (no "CloudWatch Metrics"), grupo `/ecs/otel-observability`:
+```
+fields @timestamp, @message
+| filter @logStream like /otel-collector/
+| filter @message like /error/ or @message like /Error/
+| sort @timestamp desc
+| limit 100
+```
+
+**Conectar Jaeger**: Connections → Data sources → Add new → busca "Jaeger" → URL: `http://<JAEGER_IP>:16686` (mismo puerto que la UI) → Save & test.
 
 ## Validar el pipeline completo (resumen)
 - Trazas de AWS → consola de **X-Ray** (`us-east-1`).
@@ -460,7 +528,22 @@ El formato del `traceId` — ver AWS → Paso 3.
 Fuerza el redeploy manualmente con `--force-new-deployment` (ver AWS → Paso 2).
 
 ### `service-a` (o Grafana) pierde la conexión al Collector/Prometheus sin ningún error visible
-Antes de tener Service Connect: cada redeploy del Collector o Prometheus les daba una IP nueva, y quien les hablaba (`service-a`, Grafana) seguía apuntando a la vieja — sin ningún error, los datos simplemente se perdían en el camino (revisa "Service Connect — DNS interno" más arriba). Ya resuelto para las conexiones internas a AWS con el namespace `otel-lab.internal` — sigue aplicando solo para el tramo cross-cloud hacia GCP, que no puede usar Service Connect (está fuera de la VPC).
+Antes de tener Service Connect: cada redeploy del Collector o Prometheus les daba una IP nueva, y quien les hablaba (`service-a`, Grafana) seguía apuntando a la vieja — sin ningún error, los datos simplemente se perdían en el camino. Ya resuelto para las conexiones internas a AWS con el namespace `otel-lab.internal` — sigue aplicando solo para el tramo cross-cloud hacia GCP, que no puede usar Service Connect (está fuera de la VPC).
+
+### `service-a` no exporta con `NameResolutionError: Failed to resolve '<algo>'`
+Diagnóstico: revisa primero los logs del propio `service-a` (no del Collector) en Logs Insights, filtrando `@logStream like /service-a/` — el SDK de OTel en Python sí loguea el error de conexión. Si eso no basta para confirmar la causa, la prueba definitiva es entrar al contenedor y mirar `/etc/hosts` de verdad:
+```bash
+# Instala el Session Manager plugin si no lo tienes (ver nota más abajo), luego:
+TASK_ID=$(aws ecs list-tasks --cluster otel-lab-cluster --service-name service-a --query 'taskArns[0]' --output text | tr -d '\r' | awk -F'/' '{print $NF}')
+MSYS_NO_PATHCONV=1 aws ecs execute-command --cluster otel-lab-cluster --task $TASK_ID --container service-a --interactive --command "/bin/sh"
+# dentro del contenedor:
+cat /etc/hosts
+```
+Esto requiere `enable_execute_command = true` en el servicio y un rol de tarea con permisos `ssmmessages:*` (ver `service_a_task_role` en `terraform/aws/main.tf`) — sin eso, `execute-command` falla con error de permisos.
+
+Causa confirmada en este repo: **Service Connect SÍ registra el nombre completo con el sufijo del namespace** (`otel-collector.otel-lab.internal`), no el nombre corto — confirmado viendo `/etc/hosts` real (`127.255.0.1 otel-collector.otel-lab.internal`). Un intento de usar el nombre corto (`otel-collector`, sin sufijo) fue un paso en falso basado en un ejemplo de otra configuración que no aplicaba aquí — quedó revertido a `http://otel-collector.otel-lab.internal:4318` en `terraform/aws/main.tf`.
+
+*(Nota sobre `execute-command` en Windows/Git Bash: si te da `SessionManagerPlugin is not found`, instálalo desde `https://s3.amazonaws.com/session-manager-downloads/plugin/latest/windows/SessionManagerPluginSetup.exe` y agrega su carpeta al PATH. Si después el error es `Failed to start pty: fork/exec .../usr/bin/sh: no such file or directory`, es Git Bash "traduciendo" `/bin/sh` a una ruta de Windows — antepón `MSYS_NO_PATHCONV=1` al comando, como en el ejemplo de arriba.)*
 
 ### El Collector crashea con `listen tcp 0.0.0.0:4317: bind: address already in use`
 Pasaba cuando Jaeger compartía tarea con el Collector (ya no aplica — cada uno tiene su propia tarea/ENI). Se deja documentado por si vuelves a compartir tareas por costo.

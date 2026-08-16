@@ -105,13 +105,12 @@ resource "aws_ecs_cluster" "this" {
   name = "otel-lab-cluster"
 }
 
-# --- Namespace de Cloud Map para Service Connect: DNS privado dentro de la VPC.
-# Con esto, "otel-collector.otel-lab.internal" siempre resuelve a la tarea
-# actual del Collector, sin importar cuántas veces se recree — elimina el
-# problema de tener que rastrear y volver a pasar la IP a mano cada vez.
-resource "aws_service_discovery_private_dns_namespace" "otel_lab" {
+# --- Namespace de Cloud Map para Service Connect. Usamos el tipo "HTTP"
+# (no "private DNS") porque es el que Service Connect espera realmente —
+# no crea una zona DNS real de Route 53, es un namespace lógico que
+# Service Connect usa para su propio mecanismo interno de /etc/hosts + proxy.
+resource "aws_service_discovery_http_namespace" "otel_lab" {
   name = "otel-lab.internal"
-  vpc  = data.aws_vpc.default.id
 }
 
 # --- Repositorio de imágenes: se crea a mano (aws ecr create-repository), acá solo se referencia ---
@@ -163,6 +162,40 @@ resource "aws_iam_role" "otel_collector_task_role" {
   })
 }
 
+# --- Rol de tarea para service-a, exclusivamente para habilitar ECS Exec
+# (poder abrir una terminal dentro del contenedor en ejecución) mientras
+# diagnosticamos el problema de resolución de Service Connect. Sin esto,
+# "aws ecs execute-command" falla con permisos insuficientes.
+resource "aws_iam_role" "service_a_task_role" {
+  name = "serviceATaskRole"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "service_a_exec_policy" {
+  name = "service-a-ecs-exec"
+  role = aws_iam_role.service_a_task_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "ssmmessages:CreateControlChannel",
+        "ssmmessages:CreateDataChannel",
+        "ssmmessages:OpenControlChannel",
+        "ssmmessages:OpenDataChannel"
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
 resource "aws_iam_role_policy" "otel_collector_task_policy" {
   name = "otel-collector-cloudwatch-logs"
   role = aws_iam_role.otel_collector_task_role.id
@@ -180,6 +213,26 @@ resource "aws_iam_role_policy" "otel_collector_task_policy" {
 resource "aws_iam_role_policy_attachment" "otel_collector_xray" {
   role       = aws_iam_role.otel_collector_task_role.name
   policy_arn = "arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess"
+}
+
+# --- Rol de tarea para Grafana: solo lectura de X-Ray, para el datasource
+# nativo de X-Ray (plugin aparte, se instala vía GF_INSTALL_PLUGINS en la
+# Task Definition de Grafana más abajo).
+resource "aws_iam_role" "grafana_task_role" {
+  name = "grafanaTaskRole"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ecs-tasks.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "grafana_xray_read" {
+  role       = aws_iam_role.grafana_task_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSXrayReadOnlyAccess"
 }
 
 # ============================================================
@@ -210,7 +263,10 @@ resource "aws_ecs_task_definition" "otel_collector" {
       environment = [
         { name = "CLOUD_PROVIDER", value = "aws" },
         { name = "DEPLOYMENT_ENV", value = "lab" },
-        # DNS interno de Service Connect en vez de una IP que puede cambiar.
+        # FQDN completo, con el sufijo del namespace — confirmado revisando
+        # /etc/hosts real dentro de un contenedor (aws ecs execute-command):
+        # Service Connect SÍ registra el nombre completo, no el corto. El
+        # intento anterior de usar solo "prometheus" fue un paso en falso.
         { name = "PROMETHEUS_REMOTE_WRITE_ENDPOINT", value = "http://prometheus.otel-lab.internal:9090/api/v1/write" },
         { name = "PROMETHEUS_TLS_INSECURE", value = "true" },
         { name = "CLOUDWATCH_LOG_GROUP", value = aws_cloudwatch_log_group.collector_data.name },
@@ -247,7 +303,7 @@ resource "aws_ecs_service" "otel_collector" {
   # extra) para poder resolver "prometheus.otel-lab.internal" él mismo.
   service_connect_configuration {
     enabled   = true
-    namespace = aws_service_discovery_private_dns_namespace.otel_lab.arn
+    namespace = aws_service_discovery_http_namespace.otel_lab.arn
 
     service {
       port_name      = "otlp-http"
@@ -367,7 +423,7 @@ resource "aws_ecs_service" "prometheus" {
   # Collector y Grafana lo encuentren sin necesitar su IP pública.
   service_connect_configuration {
     enabled   = true
-    namespace = aws_service_discovery_private_dns_namespace.otel_lab.arn
+    namespace = aws_service_discovery_http_namespace.otel_lab.arn
 
     service {
       port_name      = "prom-http"
@@ -391,8 +447,9 @@ resource "aws_ecs_task_definition" "service_a" {
   cpu                      = "256"
   memory                   = "512"
   execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
-  # Sin task_role_arn: service-a no llama a ninguna API de AWS por su cuenta,
-  # solo habla OTLP con el Collector y HTTP normal con service-b.
+  task_role_arn             = aws_iam_role.service_a_task_role.arn
+  # Task role usado SOLO para habilitar ECS Exec (diagnóstico), no porque
+  # service-a llame a alguna API de AWS por su cuenta.
 
   container_definitions = jsonencode([
     {
@@ -403,8 +460,10 @@ resource "aws_ecs_task_definition" "service_a" {
         { containerPort = 8000, protocol = "tcp" }
       ]
       environment = [
-        # DNS interno de Service Connect en vez de la IP pública del Collector,
-        # que cambiaba cada vez que la tarea se recreaba.
+        # FQDN completo, con el sufijo del namespace — confirmado revisando
+        # /etc/hosts real dentro de un contenedor (aws ecs execute-command):
+        # Service Connect SÍ registra el nombre completo, no el corto. El
+        # intento anterior de usar solo "otel-collector" fue un paso en falso.
         { name = "OTEL_EXPORTER_OTLP_ENDPOINT", value = "http://otel-collector.otel-lab.internal:4318" },
         { name = "SERVICE_B_URL", value = var.service_b_url }
       ]
@@ -421,11 +480,12 @@ resource "aws_ecs_task_definition" "service_a" {
 }
 
 resource "aws_ecs_service" "service_a" {
-  name            = "service-a"
-  cluster         = aws_ecs_cluster.this.id
-  task_definition = aws_ecs_task_definition.service_a.arn
-  desired_count   = 1
-  launch_type     = "FARGATE"
+  name                   = "service-a"
+  cluster                = aws_ecs_cluster.this.id
+  task_definition        = aws_ecs_task_definition.service_a.arn
+  desired_count          = 1
+  launch_type            = "FARGATE"
+  enable_execute_command = true # temporal, para diagnosticar Service Connect — ver apéndice del README
 
   network_configuration {
     subnets          = data.aws_subnets.default.ids
@@ -433,11 +493,13 @@ resource "aws_ecs_service" "service_a" {
     assign_public_ip = true
   }
 
-  # Solo cliente: necesita resolver "otel-collector.otel-lab.internal", pero
-  # nadie internamente necesita encontrar a service-a (nada de bloque "service").
+  # Solo cliente: necesita resolver "otel-collector.otel-lab.internal" (FQDN
+  # completo con el sufijo del namespace — confirmado con /etc/hosts real,
+  # ver apéndice del README), pero nadie internamente necesita encontrar a
+  # service-a (nada de bloque "service").
   service_connect_configuration {
     enabled   = true
-    namespace = aws_service_discovery_private_dns_namespace.otel_lab.arn
+    namespace = aws_service_discovery_http_namespace.otel_lab.arn
   }
 }
 
@@ -452,9 +514,16 @@ resource "aws_ecs_task_definition" "grafana" {
   family                   = "grafana"
   requires_compatibilities = ["FARGATE"]
   network_mode             = "awsvpc"
-  cpu                      = "256"
-  memory                   = "512"
+  # Grafana 13.x es bastante más pesado que el resto de servicios (tiene su
+  # propio motor de búsqueda interno, un "apiserver" nuevo, etc.) — el mismo
+  # tamaño mínimo que usamos para todo lo demás lo dejaba sin recursos: la
+  # base de datos interna se bloqueaba (SQLITE_BUSY), sus propias peticiones
+  # hacían timeout, y probablemente ECS lo reiniciaba en bucle por no
+  # responder al healthcheck a tiempo.
+  cpu                      = "512"
+  memory                   = "1024"
   execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
+  task_role_arn             = aws_iam_role.grafana_task_role.arn
 
   container_definitions = jsonencode([
     {
@@ -469,7 +538,10 @@ resource "aws_ecs_task_definition" "grafana" {
         # Es un lab con security group abierto a internet, no dejes esto así
         # en un entorno real.
         { name = "GF_SECURITY_ADMIN_USER", value = "admin" },
-        { name = "GF_SECURITY_ADMIN_PASSWORD", value = "admin" }
+        { name = "GF_SECURITY_ADMIN_PASSWORD", value = "admin" },
+        # X-Ray no viene incluido en Grafana de fábrica (a diferencia de
+        # CloudWatch/Prometheus/Jaeger) — hay que instalar su plugin aparte.
+        { name = "GF_INSTALL_PLUGINS", value = "grafana-x-ray-datasource" }
       ]
       logConfiguration = {
         logDriver = "awslogs"
@@ -501,7 +573,7 @@ resource "aws_ecs_service" "grafana" {
   # pública, que se rompía cada vez que Prometheus se recreaba.
   service_connect_configuration {
     enabled   = true
-    namespace = aws_service_discovery_private_dns_namespace.otel_lab.arn
+    namespace = aws_service_discovery_http_namespace.otel_lab.arn
   }
 }
 
