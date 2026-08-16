@@ -40,6 +40,11 @@ metrics.set_meter_provider(MeterProvider(
     metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter())],
 ))
 
+ENABLE_OTEL = os.getenv("ENABLE_OTEL", "true").lower() in ("true", "1", "yes")
+
+if ENABLE_OTEL:
+    trace.set_tracer_provider(TracerProvider())
+    trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
 
 # --- Logging estructurado básico (se refinará a JSON con trace_id en Fase 1) ---
 logger_provider = LoggerProvider(resource=_resource)
@@ -53,8 +58,9 @@ logger = logging.getLogger("service-a")
 app = FastAPI(title="service-a")
 
 # --- Auto-instrumentación OTel (HTTP entrante y saliente) ---
-FastAPIInstrumentor.instrument_app(app)
-RequestsInstrumentor().instrument()
+if ENABLE_OTEL:
+    FastAPIInstrumentor.instrument_app(app)
+    RequestsInstrumentor().instrument()
 
 tracer = trace.get_tracer("service-a")
 
