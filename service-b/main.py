@@ -26,6 +26,9 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
 
 _resource = Resource.create({SERVICE_NAME: "service-b"})
 
@@ -35,8 +38,14 @@ trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(OTLPSpanExport
 
 metrics.set_meter_provider(MeterProvider(
     resource=_resource,
-    metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter())],
+    metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter(), export_interval_millis=5000)],
 ))
+
+logger_provider = LoggerProvider(resource=_resource)
+logger_provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
+handler = LoggingHandler(level=logging.INFO, logger_provider=logger_provider)
+logging.getLogger().addHandler(handler)
+logging.getLogger().setLevel(logging.INFO)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("service-b")
