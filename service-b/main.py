@@ -11,6 +11,7 @@ GCP/AWS, se evaluará si se mantiene o se reemplaza por una DB
 gestionada (eso es decisión de arquitectura, no de esta etapa).
 """
 
+import os
 import sqlite3
 import logging
 
@@ -46,6 +47,11 @@ logger_provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter
 handler = LoggingHandler(level=logging.INFO, logger_provider=logger_provider)
 logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(logging.INFO)
+ENABLE_OTEL = os.getenv("ENABLE_OTEL", "true").lower() in ("true", "1", "yes")
+
+if ENABLE_OTEL:
+    trace.set_tracer_provider(TracerProvider())
+    trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("service-b")
@@ -53,8 +59,9 @@ logger = logging.getLogger("service-b")
 app = FastAPI(title="service-b")
 
 # --- Auto-instrumentación OTel (HTTP entrante y llamadas a sqlite3) ---
-FastAPIInstrumentor.instrument_app(app)
-SQLite3Instrumentor().instrument()
+if ENABLE_OTEL:
+    FastAPIInstrumentor.instrument_app(app)
+    SQLite3Instrumentor().instrument()
 
 tracer = trace.get_tracer("service-b")
 
