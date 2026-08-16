@@ -27,7 +27,7 @@ from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
 
 _resource = Resource.create({SERVICE_NAME: "service-a"})
 
@@ -42,8 +42,8 @@ metrics.set_meter_provider(MeterProvider(
 
 
 # --- Logging estructurado básico (se refinará a JSON con trace_id en Fase 1) ---
-logger_provider = LoggerProvider()
-logger_provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter(insecure=True)))
+logger_provider = LoggerProvider(resource=_resource)
+logger_provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
 handler = LoggingHandler(level=logging.INFO, logger_provider=logger_provider)
 logging.getLogger().addHandler(handler)
 logging.getLogger().setLevel(logging.INFO)
