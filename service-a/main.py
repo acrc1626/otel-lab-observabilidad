@@ -4,9 +4,9 @@ service-a
 Punto de entrada de una "orden". Recibe la petición del cliente
 y llama a service-b para que la procese (dependencia HTTP).
 
-Nota: esta es una base funcional simple. La configuración fina del
-OTel Collector, sampling, y semantic conventions se ajustará más
-adelante junto con el equipo (Fase 2 en adelante del laboratorio).
+Soporta la variable de entorno ENABLE_OTEL (true/false) para poder
+correr el mismo servicio con y sin instrumentación OTel, usada en
+el benchmark de overhead (Fase 4).
 """
 
 import os
@@ -16,42 +16,40 @@ import requests
 from fastapi import FastAPI, HTTPException
 
 from opentelemetry import trace, metrics
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.requests import RequestsInstrumentor
-from opentelemetry.sdk.resources import Resource, SERVICE_NAME
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
-
-_resource = Resource.create({SERVICE_NAME: "service-a"})
-
-# Endpoint leído desde OTEL_EXPORTER_OTLP_ENDPOINT
-trace.set_tracer_provider(TracerProvider(resource=_resource))
-trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
-
-metrics.set_meter_provider(MeterProvider(
-    resource=_resource,
-    metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter())],
-))
 
 ENABLE_OTEL = os.getenv("ENABLE_OTEL", "true").lower() in ("true", "1", "yes")
 
 if ENABLE_OTEL:
-    trace.set_tracer_provider(TracerProvider())
-    trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor
+    from opentelemetry.sdk.resources import Resource, SERVICE_NAME
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
 
-# --- Logging estructurado básico (se refinará a JSON con trace_id en Fase 1) ---
-logger_provider = LoggerProvider(resource=_resource)
-logger_provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
-handler = LoggingHandler(level=logging.INFO, logger_provider=logger_provider)
-logging.getLogger().addHandler(handler)
-logging.getLogger().setLevel(logging.INFO)
+    _resource = Resource.create({SERVICE_NAME: "service-a"})
+
+    # Endpoint leído desde OTEL_EXPORTER_OTLP_ENDPOINT
+    trace.set_tracer_provider(TracerProvider(resource=_resource))
+    trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+
+    metrics.set_meter_provider(MeterProvider(
+        resource=_resource,
+        metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter())],
+    ))
+
+    logger_provider = LoggerProvider(resource=_resource)
+    logger_provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
+    handler = LoggingHandler(level=logging.INFO, logger_provider=logger_provider)
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.INFO)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("service-a")
 
@@ -62,6 +60,9 @@ if ENABLE_OTEL:
     FastAPIInstrumentor.instrument_app(app)
     RequestsInstrumentor().instrument()
 
+# Cuando ENABLE_OTEL=false, trace.get_tracer() devuelve un tracer "no-op"
+# por defecto de la API de OpenTelemetry (no falla, simplemente no genera
+# ni exporta spans) — por eso el código de negocio no necesita ningún if.
 tracer = trace.get_tracer("service-a")
 
 SERVICE_B_URL = os.getenv("SERVICE_B_URL", "http://localhost:8001")
@@ -69,7 +70,7 @@ SERVICE_B_URL = os.getenv("SERVICE_B_URL", "http://localhost:8001")
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "service-a"}
+    return {"status": "ok", "service": "service-a", "otel_enabled": ENABLE_OTEL}
 
 
 @app.post("/order")

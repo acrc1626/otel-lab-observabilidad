@@ -3,10 +3,17 @@
 benchmark.py
 ------------
 Script para realizar pruebas de carga y medir el overhead de OpenTelemetry.
+Extiende el script original de Alex agregando monitoreo de CPU y memoria
+del proceso objetivo durante la ejecución del benchmark.
+
+Requiere: pip install psutil --break-system-packages
 
 Uso:
-    python benchmark.py --url http://localhost:8000/order --requests 200 --concurrency 10 --tag "Sin_OTel"
-    python benchmark.py --url http://localhost:8000/order --requests 200 --concurrency 10 --tag "Con_OTel"
+    python benchmark.py --url http://localhost:8000/order --requests 200 --concurrency 10 --tag "Sin_OTel" --pid 12345
+    python benchmark.py --url http://localhost:8000/order --requests 200 --concurrency 10 --tag "Con_OTel" --pid 12345
+
+Para obtener el PID del proceso de service-a/service-b en Windows:
+    Get-Process python | Select-Object Id, ProcessName
 """
 
 import sys
@@ -14,9 +21,15 @@ import time
 import json
 import argparse
 import statistics
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.request
 import urllib.error
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 
 def send_request(url: str, payload: dict, timeout: float = 5.0) -> tuple:
@@ -36,7 +49,7 @@ def send_request(url: str, payload: dict, timeout: float = 5.0) -> tuple:
     except urllib.error.HTTPError as e:
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
         return (elapsed_ms, e.code, False)
-    except Exception as e:
+    except Exception:
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
         return (elapsed_ms, 0, False)
 
@@ -55,7 +68,68 @@ def calculate_percentile(data: list, percentile: float) -> float:
     return data[lower] * (1.0 - weight) + data[upper] * weight
 
 
-def run_benchmark(url: str, total_requests: int, concurrency: int, tag: str, payload: dict):
+class ResourceMonitor:
+    """
+    Muestrea CPU% y memoria (RSS en MB) de un proceso cada `interval`
+    segundos, en un hilo separado, mientras el benchmark corre.
+    """
+
+    def __init__(self, pid: int, interval: float = 0.5):
+        self.pid = pid
+        self.interval = interval
+        self.cpu_samples = []
+        self.mem_samples_mb = []
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._process = None
+        self._error = None
+
+    def _run(self):
+        try:
+            self._process = psutil.Process(self.pid)
+            # Primera llamada "arranca" el cálculo de cpu_percent (siempre da 0.0)
+            self._process.cpu_percent(interval=None)
+        except psutil.NoSuchProcess:
+            self._error = f"No existe un proceso con PID {self.pid}"
+            return
+
+        while not self._stop_event.is_set():
+            try:
+                cpu = self._process.cpu_percent(interval=self.interval)
+                mem_mb = self._process.memory_info().rss / (1024 * 1024)
+                self.cpu_samples.append(cpu)
+                self.mem_samples_mb.append(mem_mb)
+            except psutil.NoSuchProcess:
+                self._error = "El proceso terminó durante el monitoreo"
+                break
+
+    def start(self):
+        if psutil is None:
+            self._error = "psutil no está instalado (pip install psutil --break-system-packages)"
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=2)
+
+    def summary(self):
+        if self._error:
+            return {"error": self._error}
+        if not self.cpu_samples:
+            return {"error": "No se capturaron muestras"}
+        return {
+            "cpu_percent_avg": round(statistics.mean(self.cpu_samples), 2),
+            "cpu_percent_max": round(max(self.cpu_samples), 2),
+            "mem_mb_avg": round(statistics.mean(self.mem_samples_mb), 2),
+            "mem_mb_max": round(max(self.mem_samples_mb), 2),
+            "samples": len(self.cpu_samples),
+        }
+
+
+def run_benchmark(url: str, total_requests: int, concurrency: int, tag: str, payload: dict, pid: int = None):
     print(f"\n==================================================")
     print(f"🚀 Iniciando Benchmark [{tag}]")
     print(f"==================================================")
@@ -63,7 +137,14 @@ def run_benchmark(url: str, total_requests: int, concurrency: int, tag: str, pay
     print(f"• Peticiones     : {total_requests}")
     print(f"• Concurrencia   : {concurrency} hilos")
     print(f"• Payload        : {json.dumps(payload)}")
+    if pid:
+        print(f"• Monitoreando PID: {pid} (CPU/memoria)")
     print(f"--------------------------------------------------")
+
+    monitor = None
+    if pid:
+        monitor = ResourceMonitor(pid)
+        monitor.start()
 
     latencies = []
     successes = 0
@@ -85,6 +166,12 @@ def run_benchmark(url: str, total_requests: int, concurrency: int, tag: str, pay
                 print(f"Progress: {i}/{total_requests} peticiones completadas...")
 
     total_time_sec = time.perf_counter() - wall_start
+
+    resource_summary = {}
+    if monitor:
+        monitor.stop()
+        resource_summary = monitor.summary()
+
     rps = total_requests / total_time_sec if total_time_sec > 0 else 0.0
 
     sorted_lat = sorted(latencies) if latencies else [0.0]
@@ -112,7 +199,8 @@ def run_benchmark(url: str, total_requests: int, concurrency: int, tag: str, pay
             "p95": round(p95_lat, 2),
             "p99": round(p99_lat, 2),
             "max": round(max_lat, 2)
-        }
+        },
+        "resources": resource_summary,
     }
 
     print("\n📊 RESULTADOS DEL BENCHMARK")
@@ -129,6 +217,17 @@ def run_benchmark(url: str, total_requests: int, concurrency: int, tag: str, pay
     print(f"   • Percentil 95: {summary['latencies_ms']['p95']} ms")
     print(f"   • Percentil 99: {summary['latencies_ms']['p99']} ms")
     print(f"   • Máxima    : {summary['latencies_ms']['max']} ms")
+    if resource_summary and "error" not in resource_summary:
+        print("--------------------------------------------------")
+        print("🖥️  RECURSOS (proceso monitoreado):")
+        print(f"   • CPU promedio : {resource_summary['cpu_percent_avg']} %")
+        print(f"   • CPU máxima   : {resource_summary['cpu_percent_max']} %")
+        print(f"   • Memoria prom.: {resource_summary['mem_mb_avg']} MB")
+        print(f"   • Memoria máx. : {resource_summary['mem_mb_max']} MB")
+        print(f"   • Muestras     : {resource_summary['samples']}")
+    elif resource_summary and "error" in resource_summary:
+        print("--------------------------------------------------")
+        print(f"⚠️  Monitoreo de recursos no disponible: {resource_summary['error']}")
     print("--------------------------------------------------\n")
 
     print("📋 TABLA PARA INFORME (Markdown):")
@@ -141,6 +240,11 @@ def run_benchmark(url: str, total_requests: int, concurrency: int, tag: str, pay
     print(f"| Latencia P95 (ms) | {summary['latencies_ms']['p95']} ms |")
     print(f"| Latencia P99 (ms) | {summary['latencies_ms']['p99']} ms |")
     print(f"| Latencia Promedio (ms) | {summary['latencies_ms']['mean']} ms |")
+    if resource_summary and "error" not in resource_summary:
+        print(f"| CPU Promedio (%) | {resource_summary['cpu_percent_avg']} % |")
+        print(f"| CPU Máxima (%) | {resource_summary['cpu_percent_max']} % |")
+        print(f"| Memoria Promedio (MB) | {resource_summary['mem_mb_avg']} MB |")
+        print(f"| Memoria Máxima (MB) | {resource_summary['mem_mb_max']} MB |")
     print("\n")
 
     return summary
@@ -153,10 +257,11 @@ def main():
     parser.add_argument("-c", "--concurrency", type=int, default=10, help="Número de hilos concurrentes")
     parser.add_argument("--tag", default="Prueba", help="Etiqueta para identificar la ejecución (ej: Sin_OTel / Con_OTel)")
     parser.add_argument("--item", default="laptop", help="Nombre del item para el payload de la orden")
+    parser.add_argument("--pid", type=int, default=None, help="PID del proceso de service-a/service-b a monitorear (CPU/memoria)")
 
     args = parser.parse_args()
     payload = {"item": args.item}
-    run_benchmark(args.url, args.requests, args.concurrency, args.tag, payload)
+    run_benchmark(args.url, args.requests, args.concurrency, args.tag, payload, pid=args.pid)
 
 
 if __name__ == "__main__":

@@ -5,10 +5,9 @@ Recibe la orden validada desde service-a y la persiste en base de
 datos. Este servicio es el que ejercita el acceso a DB dentro del
 pipeline (auto-instrumentation para sqlite3 + custom span de negocio).
 
-Nota: se usa SQLite como base de datos local para esta primera
-versión funcional. Cuando el equipo defina el despliegue real en
-GCP/AWS, se evaluará si se mantiene o se reemplaza por una DB
-gestionada (eso es decisión de arquitectura, no de esta etapa).
+Soporta la variable de entorno ENABLE_OTEL (true/false) para poder
+correr el mismo servicio con y sin instrumentación OTel, usada en
+el benchmark de overhead (Fase 4).
 """
 
 import os
@@ -18,40 +17,39 @@ import logging
 from fastapi import FastAPI
 
 from opentelemetry import trace, metrics
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-from opentelemetry.instrumentation.sqlite3 import SQLite3Instrumentor
-from opentelemetry.sdk.resources import Resource, SERVICE_NAME
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
-from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
-from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
 
-_resource = Resource.create({SERVICE_NAME: "service-b"})
-
-# Endpoint leído desde OTEL_EXPORTER_OTLP_ENDPOINT
-trace.set_tracer_provider(TracerProvider(resource=_resource))
-trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
-
-metrics.set_meter_provider(MeterProvider(
-    resource=_resource,
-    metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter(), export_interval_millis=5000)],
-))
-
-logger_provider = LoggerProvider(resource=_resource)
-logger_provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
-handler = LoggingHandler(level=logging.INFO, logger_provider=logger_provider)
-logging.getLogger().addHandler(handler)
-logging.getLogger().setLevel(logging.INFO)
 ENABLE_OTEL = os.getenv("ENABLE_OTEL", "true").lower() in ("true", "1", "yes")
 
 if ENABLE_OTEL:
-    trace.set_tracer_provider(TracerProvider())
-    trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    from opentelemetry.instrumentation.sqlite3 import SQLite3Instrumentor
+    from opentelemetry.sdk.resources import Resource, SERVICE_NAME
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.metrics import MeterProvider
+    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
+    from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+    from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+
+    _resource = Resource.create({SERVICE_NAME: "service-b"})
+
+    # Endpoint leído desde OTEL_EXPORTER_OTLP_ENDPOINT
+    trace.set_tracer_provider(TracerProvider(resource=_resource))
+    trace.get_tracer_provider().add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+
+    metrics.set_meter_provider(MeterProvider(
+        resource=_resource,
+        metric_readers=[PeriodicExportingMetricReader(OTLPMetricExporter(), export_interval_millis=5000)],
+    ))
+
+    logger_provider = LoggerProvider(resource=_resource)
+    logger_provider.add_log_record_processor(BatchLogRecordProcessor(OTLPLogExporter()))
+    handler = LoggingHandler(level=logging.INFO, logger_provider=logger_provider)
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.INFO)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("service-b")
@@ -63,6 +61,9 @@ if ENABLE_OTEL:
     FastAPIInstrumentor.instrument_app(app)
     SQLite3Instrumentor().instrument()
 
+# Cuando ENABLE_OTEL=false, trace.get_tracer() devuelve un tracer "no-op"
+# por defecto de la API de OpenTelemetry (no falla, simplemente no genera
+# ni exporta spans) — por eso el código de negocio no necesita ningún if.
 tracer = trace.get_tracer("service-b")
 
 DB_PATH = "orders.db"
@@ -78,7 +79,7 @@ def get_db():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "service-b"}
+    return {"status": "ok", "service": "service-b", "otel_enabled": ENABLE_OTEL}
 
 
 @app.post("/process")
